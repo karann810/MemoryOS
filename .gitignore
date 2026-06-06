@@ -1,0 +1,15 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+.venv/
+venv/
+docs/consolidation_log.jsonl
+benchmark/results.json
+benchmark/results.md
+.DS_Store
+*.ipynb_checkpoints
