@@ -19,14 +19,11 @@ Two modes:
      useful for testing without API calls
 """
 
-import os
 import json
 import re
-from typing import Optional
-from openai import OpenAI
-from dotenv import load_dotenv
+from typing import Any, Optional
 
-load_dotenv()
+from .llm_utils import invoke_llm
 
 EMOTION_LABELS = ["joy", "fear", "anger", "sadness", "surprise", "neutral"]
 
@@ -80,14 +77,15 @@ class EmotionTagger:
 
     def __init__(
         self,
+        llm: Any = None,
         openai_key: Optional[str] = None,
         mode: str = "llm",   # "llm" or "keyword"
         model: str = "gpt-4o-mini",
     ):
-        self.mode  = mode
-        self.model = model
-        if mode == "llm":
-            self._oai = OpenAI(api_key=openai_key or os.getenv("OPENAI_API_KEY"))
+        self.llm        = llm
+        self.openai_key = openai_key
+        self.mode       = mode
+        self.model      = model
 
     def tag(self, text: str) -> dict:
         """
@@ -116,15 +114,17 @@ class EmotionTagger:
     def _llm_tag(self, text: str) -> dict:
         """Use GPT-4o-mini to classify emotion — accurate but costs tokens."""
         try:
-            response = self._oai.chat.completions.create(
-                model=self.model,
+            response = invoke_llm(
+                self.llm,
                 messages=[
                     {"role": "user", "content": EMOTION_PROMPT.format(text=text[:500])}
                 ],
+                model=self.model,
                 temperature=0,
                 max_tokens=150,
+                openai_key=self.openai_key,
             )
-            raw = response.choices[0].message.content.strip()
+            raw = response.strip()
             # Strip markdown code fences if present
             raw = re.sub(r"```json|```", "", raw).strip()
             result = json.loads(raw)

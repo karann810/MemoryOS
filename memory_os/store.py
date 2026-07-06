@@ -17,10 +17,9 @@ Every memory carries a full "memory card" payload:
 import os
 import time
 import uuid
-from typing import Optional
+from typing import Any, Optional
 
-from dotenv import load_dotenv
-from openai import OpenAI
+from .llm_utils import embed_text
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
@@ -32,16 +31,13 @@ from qdrant_client.models import (
     PointIdsList,
 )
 
-load_dotenv()
-
 COLLECTION_NAME = os.getenv("QDRANT_COLLECTION", "memories")
 EMBEDDING_MODEL  = os.getenv("EMBEDDING_MODEL",   "text-embedding-3-small")
 VECTOR_DIM       = int(os.getenv("VECTOR_DIM",     "1536"))
 
 
-def _embed(text: str, client: OpenAI) -> list[float]:
-    response = client.embeddings.create(model=EMBEDDING_MODEL, input=text)
-    return response.data[0].embedding
+def _embed(text: str, embedder: Any, model: Optional[str], openai_key: Optional[str]) -> list[float]:
+    return embed_text(embedder=embedder, text=text, model=model, openai_key=openai_key)
 
 
 class MemoryStore:
@@ -58,15 +54,19 @@ class MemoryStore:
     def __init__(
         self,
         qdrant_url: Optional[str] = None,
-        qdrant_key: Optional[str] = None,
+        qdrant_api_key: Optional[str] = None,
+        embedder: Any = None,
+        embedding_model: Optional[str] = None,
         openai_key: Optional[str] = None,
         collection: str = COLLECTION_NAME,
     ):
-        self.collection = collection
-        self._oai = OpenAI(api_key=openai_key or os.getenv("OPENAI_API_KEY"))
+        self.collection      = collection
+        self.embedder        = embedder
+        self.embedding_model = embedding_model or os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+        self.openai_key      = openai_key
         self._qdrant = QdrantClient(
             url=qdrant_url or os.getenv("QDRANT_URL", "http://localhost:6333"),
-            api_key=qdrant_key or os.getenv("QDRANT_API_KEY"),
+            api_key=qdrant_api_key or os.getenv("QDRANT_API_KEY"),
         )
         self._ensure_collection()
 
@@ -89,7 +89,7 @@ class MemoryStore:
         extra_payload: Optional[dict] = None,
     ) -> str:
         """Embed text and store with full memory card. Returns UUID."""
-        vector = _embed(text, self._oai)
+        vector = _embed(text, self.embedder, self.embedding_model, self.openai_key)
         memory_id = str(uuid.uuid4())
         now = time.time()
 
@@ -125,7 +125,7 @@ class MemoryStore:
         Retrieve top_k most similar memories.
         Returns raw cosine similarity order — DecayReranker re-ranks these.
         """
-        query_vector = _embed(query, self._oai)
+        query_vector = _embed(query, self.embedder, self.embedding_model, self.openai_key)
 
         search_filter = None
         if memory_type:
@@ -156,6 +156,60 @@ class MemoryStore:
                     points=[r.id],
                 )
         return results
+
+    def retrieve_recent(
+        self,
+        user_id: str,
+        top_k: int = 6,
+        memory_type: Optional[str] = None,
+    ):
+        """Retrieve the most recent memories for a user by created_at."""
+        scroll_filter = [
+            FieldCondition(key="user_id", match=MatchValue(value=user_id))
+        ]
+        if memory_type:
+            scroll_filter.append(
+                FieldCondition(key="memory_type", match=MatchValue(value=memory_type))
+            )
+
+        results, _ = self._qdrant.scroll(
+            collection_name=self.collection,
+            scroll_filter=Filter(must=scroll_filter),
+            limit=1000,
+            with_payload=True,
+            with_vectors=True,
+        )
+
+        sorted_results = sorted(
+            results,
+            key=lambda r: r.payload.get("created_at", 0),
+            reverse=True,
+        )
+        return sorted_results[:top_k]
+
+    def delete_by_filter(self, user_id: str, memory_type: Optional[str] = None) -> None:
+        """Delete points matching a user_id and optional memory_type."""
+        filter_conditions = [
+            FieldCondition(key="user_id", match=MatchValue(value=user_id))
+        ]
+        if memory_type:
+            filter_conditions.append(
+                FieldCondition(key="memory_type", match=MatchValue(value=memory_type))
+            )
+
+        matching, _ = self._qdrant.scroll(
+            collection_name=self.collection,
+            scroll_filter=Filter(must=filter_conditions),
+            with_payload=False,
+            with_vectors=False,
+            limit=1000,
+        )
+        ids_to_delete = [r.id for r in matching]
+        if ids_to_delete:
+            self._qdrant.delete(
+                collection_name=self.collection,
+                points_selector=PointIdsList(points=ids_to_delete),
+            )
 
     def get_by_id(self, memory_id: str):
         results = self._qdrant.retrieve(

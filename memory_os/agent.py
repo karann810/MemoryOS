@@ -20,12 +20,8 @@ The key change from v1:
   Now:    extract N facts, store each with own importance + emotion + decay
 """
 
-import os
-from typing import Optional, TypedDict
-from dotenv import load_dotenv
-from openai import OpenAI
-
-load_dotenv()
+from typing import Any, Optional, TypedDict
+from .llm_utils import invoke_llm
 
 SYSTEM_PROMPT = """You are a helpful AI assistant with persistent memory.
 You remember past conversations and use them to give better, more personalized responses.
@@ -68,9 +64,10 @@ class MemoryAgent:
     def __init__(
         self,
         session_id:      str = "default",
-        openai_key:      Optional[str] = None,
-        model:           str = "gpt-4o-mini",
-        use_langgraph:   bool = True,
+        llm:             Any = None,
+        embedder:        Any = None,
+        qdrant_url:      Optional[str] = None,
+        qdrant_api_key:  Optional[str] = None,
         top_n_memories:  int = 5,
     ):
         from .store      import MemoryStore
@@ -80,24 +77,30 @@ class MemoryAgent:
         from .extractor  import MemoryExtractor
 
         self.session_id     = session_id
-        self.model          = model
+        self.llm            = llm
+        self.embedder       = embedder
+        self.qdrant_url     = qdrant_url
+        self.qdrant_api_key = qdrant_api_key
         self.top_n_memories = top_n_memories
-        self._oai           = OpenAI(api_key=openai_key or os.getenv("OPENAI_API_KEY"))
+        self.model          = "gpt-4o-mini"
 
         # Core components
-        self.store     = MemoryStore()
+        self.store     = MemoryStore(
+            qdrant_url     = qdrant_url,
+            qdrant_api_key = qdrant_api_key,
+            embedder       = embedder,
+        )
         self.reranker  = DecayReranker()
-        self.tagger    = EmotionTagger()
+        self.tagger    = EmotionTagger(llm=llm)
         self.router    = MemoryRouter(
             store          = self.store,
-            decay_reranker = self.reranker,
             session_id     = session_id,
         )
-        self.extractor = MemoryExtractor()
+        self.extractor = MemoryExtractor(llm=llm)
 
-        if use_langgraph:
+        try:
             self._graph = self._build_graph()
-        else:
+        except ImportError:
             self._graph = None
 
     # ── LangGraph graph ───────────────────────────────────────────────────────
@@ -168,16 +171,16 @@ class MemoryAgent:
 
     def _node_generate(self, state: AgentState) -> AgentState:
         """Node 3 — Generate response using LLM + retrieved memories."""
-        response = self._oai.chat.completions.create(
-            model=self.model,
+        reply = invoke_llm(
+            self.llm,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user",   "content": state["context_prompt"]},
             ],
+            model=self.model,
             temperature=0.7,
             max_tokens=500,
         )
-        reply = response.choices[0].message.content.strip()
         self.router.push_to_working(reply, role="assistant")
         return {**state, "response": reply}
 
@@ -234,6 +237,53 @@ class MemoryAgent:
             return final["response"]
         return self._simple_chat(query)
 
+    def get_context(self, prompt: str) -> dict:
+        """Return a context prompt and retrieved memories for a given prompt.
+
+        This is a read-only retrieval: it does NOT update access metadata
+        or push the prompt into working memory.
+        Returns: {"context_prompt": str, "memories": list[dict]}
+        """
+        memories = self.router.query(prompt, top_n=self.top_n_memories)
+
+        if memories:
+            mem_lines = "\n".join(f"[{m.get('layer','episodic')}] {m.get('text','')}" for m in memories)
+            context = CONTEXT_TEMPLATE.format(memories=mem_lines, query=prompt)
+        else:
+            context = prompt
+
+        return {"context_prompt": context, "memories": memories}
+
+    def store_interaction(self, prompt: str, response: str) -> list[str]:
+        """Store a user-agent interaction.
+
+        - Pushes `prompt` and `response` to working memory (last-15 window).
+        - Extracts facts from `prompt` and stores them using the extractor/tagger/store.
+        Returns list of stored memory UUIDs.
+        """
+        # Push to working memory
+        try:
+            self.router.push_to_working(prompt, role="user")
+            self.router.push_to_working(response, role="assistant")
+        except Exception:
+            # Best-effort: continue even if working memory is unavailable
+            pass
+
+        # Extract and store facts from the user's prompt
+        stored_ids = []
+        try:
+            stored_ids = self.extractor.extract_and_store(
+                text=prompt,
+                store=self.store,
+                tagger=self.tagger,
+                source=f"session:{self.session_id}",
+            )
+        except Exception:
+            # Don't fail the caller if storage/extraction has issues
+            stored_ids = []
+
+        return stored_ids
+
     def chat_with_debug(self, query: str) -> dict:
         """
         Like chat() but returns full pipeline info.
@@ -269,16 +319,16 @@ class MemoryAgent:
             memories=mem_lines, query=query
         ) if memories else query
 
-        response = self._oai.chat.completions.create(
-            model=self.model,
+        reply = invoke_llm(
+            self.llm,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user",   "content": context},
             ],
+            model=self.model,
             temperature=0.7,
             max_tokens=500,
         )
-        reply = response.choices[0].message.content.strip()
 
         # Store extracted facts
         if facts:

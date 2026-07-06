@@ -30,14 +30,11 @@ Why this matters:
 This is the fourth novelty of memory-os. No other tool does this.
 """
 
-import os
 import json
 import re
-from typing import Optional
-from openai import OpenAI
-from dotenv import load_dotenv
+from typing import Any, Optional
 
-load_dotenv()
+from .llm_utils import invoke_llm
 
 # ── Extraction prompt ─────────────────────────────────────────────────────────
 
@@ -125,12 +122,14 @@ class MemoryExtractor:
 
     def __init__(
         self,
+        llm: Any = None,
         openai_key: Optional[str] = None,
         model: str = "gpt-4o-mini",
         min_importance: float = 0.3,   # ignore anything below this threshold
         min_confidence: float = 0.5,   # ignore low-confidence extractions
     ):
-        self._oai            = OpenAI(api_key=openai_key or os.getenv("OPENAI_API_KEY"))
+        self.llm             = llm
+        self.openai_key      = openai_key
         self.model           = model
         self.min_importance  = min_importance
         self.min_confidence  = min_confidence
@@ -149,14 +148,16 @@ class MemoryExtractor:
             return []
 
         try:
-            response = self._oai.chat.completions.create(
-                model=self.model,
+            response = invoke_llm(
+                self.llm,
                 messages=[{
                     "role": "user",
                     "content": EXTRACTION_PROMPT.format(text=text[:1000])
                 }],
+                model=self.model,
                 temperature=0,
                 max_tokens=800,
+                openai_key=self.openai_key,
             )
             raw = response.choices[0].message.content.strip()
             raw = re.sub(r"```json|```", "", raw).strip()

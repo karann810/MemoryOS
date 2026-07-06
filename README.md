@@ -46,9 +46,8 @@ M = similarity × R(t,S) × importance × emotional_weight
 ## Architecture
 
 ```
-Working memory  →  Pinecone    (last 15 msgs, ultra-low latency)
+Working memory  →  Qdrant      (user-scoped recent prompt/response history)
 Episodic memory →  Qdrant      (time-scored events, Ebbinghaus decay)
-Semantic memory →  Weaviate    (compressed summaries, hybrid search)
 ```
 
 ## Installation
@@ -56,8 +55,10 @@ Semantic memory →  Weaviate    (compressed summaries, hybrid search)
 ```bash
 pip install memory-os
 
-# Start Qdrant locally
-docker run -p 6333:6333 qdrant/qdrant
+# Qdrant cloud mode requires URL + API key
+e.g. QDRANT_URL=https://your-project.a0c6f4.qdrant.cloud
+QDRANT_API_KEY=your-qdrant-api-key
+QDRANT_COLLECTION=memories
 
 # Copy and fill in your API keys
 cp .env.example .env
@@ -80,6 +81,36 @@ response = agent.chat("Should I add type hints to this function?")
 # End session — flush working memory
 agent.end_session()
 ```
+
+## Two-function API (minimal surface)
+
+If you prefer to manage LLM calls yourself, use the two simple methods on `MemoryAgent`:
+
+- `get_context(prompt: str) -> dict` — read-only retrieval that returns a `context_prompt` ready to include in your LLM input and a `memories` list. This does NOT update access metadata or push to working memory.
+- `store_interaction(prompt: str, response: str) -> list[str]` — after you receive the LLM response, call this to push the prompt and response into Qdrant working memory and to extract + store important facts from the prompt. Returns stored memory UUIDs.
+
+Example:
+
+```python
+from memory_os import MemoryAgent
+
+agent = MemoryAgent(session_id="alice", use_langgraph=False)
+
+# 1) Get context to include in your LLM call (read-only)
+ctx = agent.get_context("How do I set up auth in Next.js?")
+# Use ctx['context_prompt'] when building your LLM messages
+
+# 2) You call your LLM with the prompt + ctx['context_prompt'] and receive `llm_reply`
+
+# 3) Store the interaction and extracted memories
+stored_ids = agent.store_interaction("How do I set up auth in Next.js?", llm_reply)
+print("Stored memory ids:", stored_ids)
+```
+
+Notes:
+- `get_context` is intentionally read-only so retrieval doesn't alter memory access traces unless you explicitly call `store_interaction`.
+- Extraction runs on the user's `prompt` only (not the assistant response) by default; extracted facts are emotion-tagged and stored individually.
+
 
 ## Run the benchmark
 
