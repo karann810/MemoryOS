@@ -11,6 +11,7 @@ prompt/response history per session.
 ## Public API
 
 ```python
+pip install pymemoryos
 from memory_os import MemoryOS
 
 memory = MemoryOS(
