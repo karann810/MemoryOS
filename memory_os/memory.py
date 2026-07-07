@@ -138,6 +138,13 @@ class MemoryOS:
         self._session_pairs.setdefault(session_id, [])
         self._embedder = SentenceTransformer(DEFAULT_EMBEDDING_MODEL)
 
+        # Eagerly create the collection + payload indexes now, instead of
+        # waiting for the first successful .store() call. This guarantees
+        # .retrieve() never hits a "missing index" 400 error, even if it's
+        # called before any .store(), or in a fresh process/kernel.
+        vector_size = self._embedder.get_sentence_embedding_dimension()
+        self._ensure_collection(vector_size)
+
     def store(self, prompt: str, response: str) -> None:
         """Extract prompt memories into Qdrant and keep the raw pair in session history."""
         if not prompt or not response:
@@ -380,8 +387,14 @@ class MemoryOS:
                     field_name="pair_id",
                     field_schema="keyword",
                 )
-            except Exception:
-                pass
+            except UnexpectedResponse as exc:
+                # Qdrant returns 400 if the index already exists on a
+                # collection created in an earlier run - that's fine, not
+                # an error we need to surface.
+                if "already exists" not in str(exc):
+                    raise
+            except Exception as exc:
+                print(f"[MemoryOS] Warning: failed to create payload index: {exc}")
         self._payload_indexes_ready = True
 
     def _collection_exists(self) -> bool:
