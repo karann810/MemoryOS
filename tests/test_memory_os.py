@@ -43,11 +43,11 @@ class FakeLLM:
         return json.dumps({"memories": [{"text": "General memory", "importance": 0.7, "emotion": "neutral"}]})
 
 
-class FakeEmbeddingModel:
+class FakeSentenceTransformer:
     def __init__(self):
         self.texts = []
 
-    def embed(self, text):
+    def encode(self, text, convert_to_numpy=False, normalize_embeddings=True):
         self.texts.append(text)
         return [float(len(text)), 1.0, 0.5]
 
@@ -105,30 +105,36 @@ class FakeQdrantClient:
 def make_memory(monkeypatch, session_id="user_1"):
     MemoryOS._session_pairs.clear()
     clients = []
+    embedders = []
 
     def client_factory(*args, **kwargs):
         client = FakeQdrantClient(*args, **kwargs)
         clients.append(client)
         return client
 
+    def embedder_factory(*args, **kwargs):
+        embedder = FakeSentenceTransformer()
+        embedders.append(embedder)
+        return embedder
+
     monkeypatch.setattr("memory_os.memory.QdrantClient", client_factory)
+    monkeypatch.setattr("memory_os.memory.SentenceTransformer", embedder_factory)
     memory = MemoryOS(
         qdrant_url="http://qdrant.test",
         qdrant_api_key="key",
         llm=FakeLLM(),
-        embedding_model=FakeEmbeddingModel(),
         session_id=session_id,
     )
-    return memory, clients[0]
+    return memory, clients[0], embedders[0]
 
 
 def test_store_extracts_multiple_memories_with_metadata(monkeypatch):
-    memory, client = make_memory(monkeypatch)
+    memory, client, embedder = make_memory(monkeypatch)
 
     memory.store("I prefer Python and I am building an auth feature", "Got it")
 
     assert len(memory.llm.prompts) == 1
-    assert memory.embedding_model.texts == [
+    assert embedder.texts == [
         "User prefers Python",
         "User is building an auth feature",
     ]
@@ -142,7 +148,7 @@ def test_store_extracts_multiple_memories_with_metadata(monkeypatch):
 
 
 def test_retrieve_updates_decay_state_and_returns_scores(monkeypatch):
-    memory, client = make_memory(monkeypatch)
+    memory, client, _ = make_memory(monkeypatch)
 
     memory.store("I have a deadline and I am stressed", "Stored")
     point = client.points[0]
@@ -158,8 +164,8 @@ def test_retrieve_updates_decay_state_and_returns_scores(monkeypatch):
 
 
 def test_retrieve_is_scoped_by_session_and_returns_recent_pairs(monkeypatch):
-    memory, client = make_memory(monkeypatch, session_id="user_1")
-    other, _ = make_memory(monkeypatch, session_id="user_2")
+    memory, client, embedder = make_memory(monkeypatch, session_id="user_1")
+    other, _, _ = make_memory(monkeypatch, session_id="user_2")
     other._client = client
     other._collection_ready = True
 
@@ -179,10 +185,11 @@ def test_retrieve_is_scoped_by_session_and_returns_recent_pairs(monkeypatch):
             "created_at": MemoryOS._session_pairs["user_1"][0]["created_at"],
         }
     ]
+    assert embedder.texts[-1] == "What do I prefer?"
 
 
 def test_store_keeps_only_latest_seven_pairs(monkeypatch):
-    memory, client = make_memory(monkeypatch)
+    memory, client, _ = make_memory(monkeypatch)
 
     for index in range(8):
         memory.store(f"prompt {index}", f"response {index}")
@@ -201,7 +208,7 @@ def test_store_keeps_only_latest_seven_pairs(monkeypatch):
 
 
 def test_retrieve_returns_latest_five_prompt_response_pairs(monkeypatch):
-    memory, _ = make_memory(monkeypatch)
+    memory, _, _ = make_memory(monkeypatch)
 
     for index in range(7):
         memory.store(f"prompt {index}", f"response {index}")

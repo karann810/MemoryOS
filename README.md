@@ -18,7 +18,6 @@ memory = MemoryOS(
     qdrant_url="https://your-qdrant-url",
     qdrant_api_key="your-qdrant-api-key",
     llm=configured_llm,                    # any object with .invoke()
-    embedding_model=configured_embed_model, # any object with .embed()
     session_id="user_123",
 )
 
@@ -44,12 +43,12 @@ memory.store(user_prompt, final_response)
 
 - `store(prompt, response)` calls `llm.invoke(...)` once to distill the completed
   prompt into multiple important memory chunks.
-- `store(prompt, response)` calls `embedding_model.embed(...)` on each extracted
-  memory chunk, then upserts those chunks separately to Qdrant.
+- `store(prompt, response)` embeds each extracted memory chunk with an internal
+  SentenceTransformer model, then upserts those chunks separately to Qdrant.
 - `store(prompt, response)` also stores the raw prompt/response pair in a simple
   rolling session history capped at 7 pairs.
-- `retrieve(prompt)` calls `embedding_model.embed(...)` to vectorize the current
-  prompt, then queries Qdrant for relevant memories.
+- `retrieve(prompt)` embeds the current prompt with the same internal
+  SentenceTransformer model, then queries Qdrant for relevant memories.
 - `retrieve(prompt)` reranks Qdrant hits using an Ebbinghaus-style decay score:
   `similarity * decay_score * importance * emotional_weight`.
 - `retrieve(prompt)` also returns the latest 4-5 stored prompt/response pairs for
@@ -85,6 +84,6 @@ memory.store(user_prompt, final_response)
 
 - MemoryOS never generates the final answer to a user query.
 - MemoryOS uses `llm.invoke()` only to break the user's prompt into storable memory chunks.
-- MemoryOS uses `embedding_model.embed()` only for vector storage and retrieval.
+- MemoryOS uses an internal SentenceTransformer embedder for vector storage and retrieval.
 - Required init config is exactly `qdrant_url`, `qdrant_api_key`, `llm`,
-  `embedding_model`, and `session_id`.
+  and `session_id`.

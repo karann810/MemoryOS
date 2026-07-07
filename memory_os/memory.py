@@ -36,6 +36,11 @@ except Exception:
     PointStruct = None
     VectorParams = None
 
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception:
+    SentenceTransformer = None
+
 
 COLLECTION_NAME = "memory_os"
 SESSION_PAIR_CAP = 7
@@ -45,6 +50,7 @@ RECENT_PAIR_LIMIT = 5
 SECONDS_PER_DAY = 86400.0
 DEFAULT_STABILITY = 2.0
 STABILITY_GROWTH = 0.75
+DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 EMOTION_WEIGHTS = {
     "joy": 1.15,
@@ -97,7 +103,6 @@ class MemoryOS:
         qdrant_url: str,
         qdrant_api_key: str,
         llm: Any,
-        embedding_model: Any,
         session_id: str,
     ) -> None:
         missing = [
@@ -105,7 +110,6 @@ class MemoryOS:
             for name, value in {
                 "qdrant_url": qdrant_url,
                 "llm": llm,
-                "embedding_model": embedding_model,
                 "session_id": session_id,
             }.items()
             if not value
@@ -114,22 +118,24 @@ class MemoryOS:
             raise ValueError(f"Missing required MemoryOS config: {', '.join(missing)}")
         if not hasattr(llm, "invoke"):
             raise TypeError("llm must provide an invoke(prompt: str) method")
-        if not hasattr(embedding_model, "embed"):
-            raise TypeError("embedding_model must provide an embed(text: str) method")
         if QdrantClient is None:
             raise ImportError(
                 "MemoryOS requires qdrant-client. Install the package dependencies before use."
+            )
+        if SentenceTransformer is None:
+            raise ImportError(
+                "MemoryOS requires sentence-transformers. Install package dependencies before use."
             )
 
         self.qdrant_url = qdrant_url
         self.qdrant_api_key = qdrant_api_key
         self.llm = llm
-        self.embedding_model = embedding_model
         self.session_id = session_id
         self.collection = COLLECTION_NAME
         self._client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key or None)
         self._collection_ready = False
         self._session_pairs.setdefault(session_id, [])
+        self._embedder = SentenceTransformer(DEFAULT_EMBEDDING_MODEL)
 
     def store(self, prompt: str, response: str) -> None:
         """Extract prompt memories into Qdrant and keep the raw pair in session history."""
@@ -330,22 +336,10 @@ class MemoryOS:
         ]
 
     def _embed(self, text: str) -> list[float]:
-        embedded = self.embedding_model.embed(text)
-        if hasattr(embedded, "embedding"):
-            embedded = embedded.embedding
-        elif isinstance(embedded, dict):
-            embedded = embedded.get("embedding", embedded.get("vector", embedded))
-        elif (
-            isinstance(embedded, list)
-            and embedded
-            and isinstance(embedded[0], dict)
-            and "embedding" in embedded[0]
-        ):
-            embedded = embedded[0]["embedding"]
-
+        embedded = self._embedder.encode(text, convert_to_numpy=False, normalize_embeddings=True)
         vector = list(embedded)
         if not vector:
-            raise ValueError("embedding_model.embed() returned an empty vector")
+            raise ValueError("SentenceTransformer returned an empty vector")
         return [float(value) for value in vector]
 
     def _ensure_collection(self, vector_size: int) -> None:
