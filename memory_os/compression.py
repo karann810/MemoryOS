@@ -1,29 +1,13 @@
 """
-memory_os/compression.py  —  Week 3: Memory Consolidation (Sleep Cycle)
-========================================================================
-This implements the most novel research contribution of memory-os.
+memory_os/compression.py  —  Memory Consolidation (Sleep Cycle)
+================================================================
+Clusters episodic memories → summarizes each cluster → stores as semantic.
 
-The question (Gap 2 from our research framing):
-  When you cluster episodic memories and summarize them into a semantic
-  memory — is the summary vector semantically equivalent to the centroid
-  of the cluster?
+Novel research contribution: we test whether the LLM summary vector
+is semantically equivalent to the centroid of the original cluster.
+Results are logged to consolidation_log.jsonl.
 
-  This has NEVER been tested or published. We test it here and log results.
-
-What this module does:
-  1. Runs as a background job (APScheduler, every N conversations or nightly)
-  2. Fetches all episodic memories from Qdrant
-  3. Clusters them with HDBSCAN (density-based, handles noise)
-  4. For each cluster:
-     a. Asks LLM to summarize the cluster into one semantic insight
-     b. Embeds the summary → summary_vector
-     c. Computes centroid of the cluster's raw vectors
-     d. Logs cosine similarity(summary_vector, centroid)  ← the research question
-     e. Stores summary as a new "semantic" memory
-     f. Deletes the original episodic memories
-  5. Saves consolidation stats to docs/consolidation_log.jsonl for analysis
-
-The logged data answers Gap 2 and is publishable.
+Uses litellm — works with any LLM provider.
 """
 
 import os
@@ -34,14 +18,25 @@ import logging
 from typing import Optional
 
 import numpy as np
-from dotenv import load_dotenv
-from openai import OpenAI
-from apscheduler.schedulers.background import BackgroundScheduler
+try:
+    import litellm
+except Exception:
+    from . import _litellm as litellm
+try:
+    import instructor
+except Exception:
+    from . import _instructor as instructor
+from .schemas import ConsolidationSummary
 
-load_dotenv()
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    _HAS_SCHEDULER = True
+except ImportError:
+    _HAS_SCHEDULER = False
+
 logger = logging.getLogger(__name__)
 
-CONSOLIDATION_LOG = os.getenv("CONSOLIDATION_LOG", "docs/consolidation_log.jsonl")
+CONSOLIDATION_LOG = os.getenv("CONSOLIDATION_LOG", "consolidation_log.jsonl")
 
 SUMMARY_PROMPT = """You are a memory consolidation system for an AI agent.
 
@@ -61,9 +56,7 @@ Semantic insight:"""
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    """Cosine similarity between two vectors."""
-    norm_a = np.linalg.norm(a)
-    norm_b = np.linalg.norm(b)
+    norm_a, norm_b = np.linalg.norm(a), np.linalg.norm(b)
     if norm_a == 0 or norm_b == 0:
         return 0.0
     return float(np.dot(a, b) / (norm_a * norm_b))
@@ -74,186 +67,174 @@ class MemoryConsolidator:
     Runs the sleep cycle: cluster episodic memories → summarize → store semantic.
 
     Usage:
-        consolidator = MemoryConsolidator(store)
+        consolidator = MemoryConsolidator(
+            store     = store,
+            llm_model = "gpt-4o-mini",
+            api_key   = "sk-...",
+        )
+        stats = consolidator.consolidate()
+        print(f"Consolidated {stats['clusters_processed']} clusters")
 
-        # Run once manually
-        stats = consolidator.run()
-
-        # Schedule nightly
-        consolidator.schedule(hour=3, minute=0)
+        # Run automatically every N minutes:
+        consolidator.start_scheduler(interval_minutes=60)
     """
 
     def __init__(
         self,
-        store,                           # MemoryStore instance
-        openai_key: Optional[str] = None,
-        min_cluster_size: int = 3,       # HDBSCAN: min memories to form a cluster
-        min_memories_to_run: int = 10,   # don't consolidate until we have enough
-        log_path: str = CONSOLIDATION_LOG,
+        store,
+        llm_model: str = "gpt-4o-mini",
+        api_key:   str = "",
+        min_cluster_size: int = 3,
+        min_importance:   float = 0.4,
+        log_path:         str = CONSOLIDATION_LOG,
     ):
-        self.store              = store
-        self.min_cluster_size   = min_cluster_size
-        self.min_memories_to_run = min_memories_to_run
-        self.log_path           = log_path
-        self._oai               = OpenAI(api_key=openai_key or os.getenv("OPENAI_API_KEY"))
-        self._scheduler         = None
+        self.store            = store
+        self.llm_model        = llm_model
+        self.min_cluster_size = min_cluster_size
+        self.min_importance   = min_importance
+        self.log_path         = log_path
 
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        self._client = instructor.from_litellm(litellm.completion)
+        from ._utils import set_litellm_key
+        set_litellm_key(llm_model, api_key)
 
-    def run(self) -> dict:
+        self._scheduler = None
+
+    def consolidate(self) -> dict:
         """
-        Run one consolidation cycle.
-        Returns stats dict: clusters_found, memories_compressed, avg_centroid_similarity
+        Run one consolidation cycle. Returns stats dict.
         """
-        logger.info("[Consolidator] Starting sleep cycle...")
-
-        # 1. Fetch all episodic memories
-        episodic = self.store.get_all(memory_type="episodic")
-        if len(episodic) < self.min_memories_to_run:
-            logger.info(f"[Consolidator] Only {len(episodic)} episodic memories — skipping.")
-            return {"status": "skipped", "reason": "not enough memories"}
-
-        logger.info(f"[Consolidator] Clustering {len(episodic)} episodic memories...")
-
-        # 2. Extract vectors
-        vectors = np.array([m.vector for m in episodic])
-        ids     = [m.id for m in episodic]
-        texts   = [m.payload.get("text", "") for m in episodic]
-
-        # 3. Cluster with HDBSCAN
         try:
             import hdbscan
         except ImportError:
-            raise ImportError("pip install hdbscan")
+            raise ImportError("pip install hdbscan to use consolidation")
 
-        clusterer = hdbscan.HDBSCAN(
-            min_cluster_size=self.min_cluster_size,
-            metric="euclidean",
-            prediction_data=True,
-        )
-        labels = clusterer.fit_predict(vectors)
+        memories = self.store.get_all(memory_type="episodic", limit=2000)
+        if len(memories) < self.min_cluster_size:
+            return {"status": "skipped", "reason": "not enough memories", "count": len(memories)}
+
+        # Get vectors and payloads
+        vectors  = np.array([m.vector for m in memories])
+        payloads = [m.payload for m in memories]
+        ids      = [str(m.id) for m in memories]
+
+        # Cluster with HDBSCAN
+        clusterer = hdbscan.HDBSCAN(min_cluster_size=self.min_cluster_size, metric="euclidean")
+        labels    = clusterer.fit_predict(vectors)
 
         unique_labels = set(labels) - {-1}  # -1 = noise
-        logger.info(f"[Consolidator] Found {len(unique_labels)} clusters, "
-                    f"{(labels == -1).sum()} noise points")
-
         stats = {
-            "timestamp":             time.time(),
-            "episodic_count":        len(episodic),
-            "clusters_found":        len(unique_labels),
-            "memories_compressed":   0,
-            "centroid_similarities": [],
+            "status":             "ok",
+            "total_memories":     len(memories),
+            "clusters_found":     len(unique_labels),
+            "clusters_processed": 0,
+            "memories_deleted":   0,
+            "semantic_stored":    0,
         }
 
-        # 4. Process each cluster
-        for cluster_id in unique_labels:
-            mask        = labels == cluster_id
-            cluster_ids = [ids[i]   for i, m in enumerate(mask) if m]
-            cluster_txt = [texts[i] for i, m in enumerate(mask) if m]
-            cluster_vecs = vectors[mask]
+        for label in unique_labels:
+            mask     = labels == label
+            indices  = [i for i, m in enumerate(mask) if m]
+            cluster_vectors  = vectors[mask]
+            cluster_payloads = [payloads[i] for i in indices]
+            cluster_ids      = [ids[i] for i in indices]
 
-            # a. Summarize with LLM
-            summary = self._summarize(cluster_txt)
-            if not summary:
+            # Skip low-importance clusters
+            avg_importance = np.mean([p.get("importance", 0.5) for p in cluster_payloads])
+            if avg_importance < self.min_importance:
                 continue
 
-            # b. Embed summary
-            summary_vector = self._embed(summary)
+            # Summarize cluster
+            mem_texts  = [p.get("text", "") for p in cluster_payloads]
+            summary_obj = self._summarize(mem_texts)
+            if not summary_obj:
+                continue
 
-            # c. Compute centroid of cluster
-            centroid = cluster_vecs.mean(axis=0)
+            # Research measurement: summary_vec vs centroid cosine similarity
+            centroid     = cluster_vectors.mean(axis=0)
+            summary_vec  = self.store.embed(summary_obj.summary)
+            cos_sim      = cosine_similarity(np.array(summary_vec), centroid)
 
-            # d. THE RESEARCH MEASUREMENT: similarity(summary, centroid)
-            sim = cosine_similarity(np.array(summary_vector), centroid)
-            stats["centroid_similarities"].append(sim)
-            logger.info(f"[Consolidator] Cluster {cluster_id}: "
-                        f"{len(cluster_ids)} memories → sim={sim:.4f}")
-
-            # Inherit emotional weight from strongest memory in cluster
-            payloads = [m.payload for m in episodic if m.id in cluster_ids]
-            max_emotional = max(
-                (p.get("emotional_score", 0.0) for p in payloads), default=0.0
-            )
+            # Store as semantic memory
             dominant_emotion = max(
-                payloads,
+                cluster_payloads,
                 key=lambda p: p.get("emotional_score", 0.0),
-                default={}
-            ).get("emotional_label", "neutral")
-
-            # e. Store as semantic memory
-            self.store.insert(
-                text           = summary,
-                importance     = min(0.5 + (len(cluster_ids) * 0.05), 1.0),
-                memory_type    = "semantic",
-                emotional_score = max_emotional,
-                emotional_label = dominant_emotion,
-                source         = "consolidator",
-                extra_payload  = {
-                    "source_count":         len(cluster_ids),
-                    "centroid_similarity":  sim,
-                    "cluster_id":           int(cluster_id),
+            )
+            mid = self.store.insert(
+                text            = summary_obj.summary,
+                importance      = float(avg_importance),
+                memory_type     = "semantic",
+                emotional_score = summary_obj.emotional_score,
+                emotional_label = summary_obj.key_emotion,
+                source          = "consolidator",
+                extra_payload   = {
+                    "source_count":       len(cluster_ids),
+                    "centroid_cos_sim":   round(cos_sim, 4),
+                    "cluster_label":      int(label),
                 },
             )
 
-            # f. Delete originals
-            for mid in cluster_ids:
-                self.store.delete(mid)
+            # Delete source episodic memories
+            for mid_del in cluster_ids:
+                try:
+                    self.store.delete(mid_del)
+                except Exception:
+                    pass
 
-            stats["memories_compressed"] += len(cluster_ids)
+            # Log research data
+            self._log({
+                "timestamp":         time.time(),
+                "cluster_size":      len(cluster_ids),
+                "centroid_cos_sim":  cos_sim,
+                "avg_importance":    float(avg_importance),
+                "key_emotion":       summary_obj.key_emotion,
+                "confidence":        summary_obj.confidence,
+                "summary":           summary_obj.summary,
+            })
 
-        # Compute avg similarity (the key research metric)
-        if stats["centroid_similarities"]:
-            stats["avg_centroid_similarity"] = sum(stats["centroid_similarities"]) / len(
-                stats["centroid_similarities"]
-            )
-        else:
-            stats["avg_centroid_similarity"] = None
+            stats["clusters_processed"] += 1
+            stats["memories_deleted"]   += len(cluster_ids)
+            stats["semantic_stored"]    += 1
 
-        # 5. Log for research analysis
-        self._log(stats)
-        logger.info(f"[Consolidator] Done. Compressed {stats['memories_compressed']} memories. "
-                    f"Avg centroid sim: {stats.get('avg_centroid_similarity', 'N/A'):.4f}")
         return stats
 
-    def schedule(self, hour: int = 3, minute: int = 0) -> None:
-        """Schedule the sleep cycle to run nightly at hour:minute."""
-        self._scheduler = BackgroundScheduler()
-        self._scheduler.add_job(self.run, "cron", hour=hour, minute=minute)
-        self._scheduler.start()
-        logger.info(f"[Consolidator] Scheduled nightly at {hour:02d}:{minute:02d}")
-
-    def stop_schedule(self) -> None:
-        if self._scheduler:
-            self._scheduler.shutdown()
-
-    def _summarize(self, texts: list[str]) -> Optional[str]:
-        """Ask LLM to compress a cluster of texts into one semantic insight."""
-        memories_str = "\n".join(f"- {t}" for t in texts)
+    def _summarize(self, texts: list[str]) -> Optional[ConsolidationSummary]:
         try:
-            response = self._oai.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{
-                    "role": "user",
+            return self._client.chat.completions.create(
+                model          = self.llm_model,
+                response_model = ConsolidationSummary,
+                max_retries    = 2,
+                messages       = [{
+                    "role":    "user",
                     "content": SUMMARY_PROMPT.format(
-                        n=len(texts), memories=memories_str
-                    )
+                        n=len(texts),
+                        memories="\n".join(f"- {t}" for t in texts),
+                    ),
                 }],
-                temperature=0.3,
-                max_tokens=150,
+                temperature = 0,
+                max_tokens  = 200,
             )
-            return response.choices[0].message.content.strip()
         except Exception as e:
-            logger.error(f"[Consolidator] Summarization failed: {e}")
+            logger.warning(f"Consolidation summarize failed: {e}")
             return None
 
-    def _embed(self, text: str) -> list[float]:
-        response = self._oai.embeddings.create(
-            model=os.getenv("EMBEDDING_MODEL", "text-embedding-3-small"),
-            input=text,
-        )
-        return response.data[0].embedding
+    def _log(self, data: dict) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.log_path) or ".", exist_ok=True)
+            with open(self.log_path, "a") as f:
+                f.write(json.dumps(data) + "\n")
+        except Exception:
+            pass
 
-    def _log(self, stats: dict) -> None:
-        """Append consolidation stats to JSONL file for research analysis."""
-        with open(self.log_path, "a") as f:
-            f.write(json.dumps(stats) + "\n")
+    def start_scheduler(self, interval_minutes: int = 60) -> None:
+        """Run consolidation in background every N minutes."""
+        if not _HAS_SCHEDULER:
+            raise ImportError("pip install apscheduler to use scheduler")
+        self._scheduler = BackgroundScheduler()
+        self._scheduler.add_job(self.consolidate, "interval", minutes=interval_minutes)
+        self._scheduler.start()
+        logger.info(f"Consolidation scheduler started — runs every {interval_minutes} min")
+
+    def stop_scheduler(self) -> None:
+        if self._scheduler:
+            self._scheduler.shutdown()

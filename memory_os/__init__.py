@@ -1,24 +1,6 @@
-"""
-memory-os: Brain-like memory for AI agents.
-Grounded in Ebbinghaus forgetting curves, emotional tagging,
-and memory consolidation research.
-"""
+"""memory-os: compact Qdrant-backed memory for host-owned LLM apps."""
 
-from .store       import MemoryStore
-from .decay       import DecayReranker
-from .emotion     import EmotionTagger
-from .extractor   import MemoryExtractor
-from .compression import MemoryConsolidator
-from .router      import MemoryRouter
-from .agent       import MemoryAgent
+from .memory import MemoryOS
 
 __version__ = "0.1.0"
-__all__ = [
-    "MemoryStore",
-    "DecayReranker",
-    "EmotionTagger",
-    "MemoryExtractor",
-    "MemoryConsolidator",
-    "MemoryRouter",
-    "MemoryAgent",
-]
+__all__ = ["MemoryOS"]

@@ -6,10 +6,6 @@ __pycache__/
 dist/
 build/
 *.egg-info/
-.venv/
-venv/
-docs/consolidation_log.jsonl
-benchmark/results.json
-benchmark/results.md
-.DS_Store
-*.ipynb_checkpoints
+.ruff_cache/
+.mypy_cache/
+consolidation_log.jsonl

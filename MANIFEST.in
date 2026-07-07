@@ -1,0 +1,7 @@
+include README.md
+include LICENSE
+recursive-include memory_os *.py
+include tests/test_memory_os.py
+prune .pytest_cache
+recursive-exclude * __pycache__
+recursive-exclude * *.py[cod]

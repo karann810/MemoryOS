@@ -1,63 +1,41 @@
 """
-memory_os/emotion.py  —  Emotional Tagger
-==========================================
-Tags every memory with an emotional label and intensity score
-before it gets stored. This feeds directly into the Ebbinghaus
-stability calculation in decay.py.
-
-Why this matters:
-  McGaugh (2000) showed that emotional arousal during or after
-  an event triggers amygdala activation which strengthens
-  hippocampal memory consolidation. Fearful/angry/joyful events
-  are remembered far better than neutral ones.
-
-  No existing AI memory tool implements this. We do.
+memory_os/emotion.py  —  Emotional Tagger (Instructor + LiteLLM)
+=================================================================
+Tags every memory with emotional label + intensity before storage.
 
 Two modes:
-  1. LLM mode (default, accurate)  — asks GPT to classify emotion
-  2. Keyword mode (fast, offline)  — simple keyword matching
-     useful for testing without API calls
+  "llm" (default) — accurate, uses Instructor
+  "off"           — skips tagging, everything = neutral (faster/cheaper)
 """
 
-import json
-import re
-from typing import Any, Optional
-
-from .llm_utils import invoke_llm
-
-EMOTION_LABELS = ["joy", "fear", "anger", "sadness", "surprise", "neutral"]
-
-# Keyword fallback for fast/offline mode
-EMOTION_KEYWORDS = {
-    "joy":      ["happy", "excited", "love", "great", "wonderful", "amazing",
-                 "delighted", "pleased", "glad", "celebrate", "win", "success"],
-    "fear":     ["scared", "afraid", "terrified", "worried", "anxious",
-                 "nervous", "panic", "dread", "threat", "danger", "risk"],
-    "anger":    ["angry", "furious", "annoyed", "frustrated", "hate",
-                 "mad", "rage", "outraged", "irritated", "upset"],
-    "sadness":  ["sad", "depressed", "unhappy", "sorry", "regret",
-                 "disappointed", "grief", "miss", "loss", "lonely"],
-    "surprise": ["surprised", "shocked", "unexpected", "suddenly",
-                 "amazed", "astonished", "wow", "unbelievable", "whoa"],
-}
+try:
+    import litellm
+except Exception:
+    from . import _litellm as litellm
+try:
+    import instructor
+except Exception:
+    from . import _instructor as instructor
+from ._utils import set_litellm_key
+from .schemas import EmotionResult
 
 EMOTION_PROMPT = """You are an emotion classifier for a memory system.
 
-Given the following text, return a JSON object with:
-- "label": one of ["joy", "fear", "anger", "sadness", "surprise", "neutral"]
-- "score": float 0.0-1.0 representing emotional intensity
-  (0.0 = completely neutral, 1.0 = extremely intense emotion)
-- "reasoning": one sentence explaining your choice
+Classify the emotion in the following text.
 
 Rules:
-- Most factual/informational statements should be "neutral" with score < 0.2
-- Only assign non-neutral if there is clear emotional content
-- Score reflects intensity, not just presence of emotion
-
-Return ONLY valid JSON, no other text.
+- Most factual/informational statements = neutral with low score
+- Understand negation: "not happy" is NOT joy
+- Only assign non-neutral if there is CLEAR emotional content
 
 Text: "{text}"
 """
+
+NEUTRAL_RESULT = EmotionResult(
+    label="neutral",
+    score=0.0,
+    reasoning="Emotion tagging disabled (mode=off)",
+)
 
 
 class EmotionTagger:
@@ -65,103 +43,73 @@ class EmotionTagger:
     Tags text with emotional label and intensity before memory storage.
 
     Usage:
-        tagger = EmotionTagger()
+        tagger = EmotionTagger(model="gpt-4o-mini", api_key="sk-...")
         result = tagger.tag("I'm terrified of losing my job")
-        # {"label": "fear", "score": 0.85, "reasoning": "..."}
+        print(result.label, result.score)   # fear, 0.85
 
-        # Use in store.insert:
-        emotion = tagger.tag(text)
-        store.insert(text, emotional_label=emotion["label"],
-                           emotional_score=emotion["score"])
+        # Disable for testing / cost savings
+        tagger = EmotionTagger(model="gpt-4o-mini", api_key="sk-...", mode="off")
     """
 
     def __init__(
         self,
-        llm: Any = None,
-        openai_key: Optional[str] = None,
-        mode: str = "llm",   # "llm" or "keyword"
-        model: str = "gpt-4o-mini",
+        model:   str = "gpt-4o-mini",
+        api_key: str = "",
+        mode:    str = "llm",
     ):
-        self.llm        = llm
-        self.openai_key = openai_key
-        self.mode       = mode
-        self.model      = model
+        if mode not in ("llm", "off", "keyword"):
+            raise ValueError(f"Invalid mode '{mode}'. Use 'llm', 'off' or 'keyword'.")
+        self.mode  = mode
+        self.model = model
+        if mode == "llm":
+            self._client = instructor.from_litellm(litellm.completion)
+            set_litellm_key(model, api_key)
 
-    def tag(self, text: str) -> dict:
-        """
-        Returns dict with keys: label, score, reasoning
-        """
+        # Keyword mode: simple heuristic-based tagging (fast, deterministic)
+        if mode == "keyword":
+            self.mode = "keyword"
+
+    def tag(self, text: str) -> EmotionResult:
+        """Tag text with emotion. Never crashes — returns neutral on failure."""
+        if self.mode == "off":
+            return NEUTRAL_RESULT
         if self.mode == "keyword":
-            return self._keyword_tag(text)
-        return self._llm_tag(text)
-
-    def tag_and_insert(self, text: str, store, **insert_kwargs) -> str:
-        """
-        Convenience: tag emotion then insert into store.
-        Returns memory UUID.
-
-        Usage:
-            mid = tagger.tag_and_insert("I love Python!", store, importance=0.7)
-        """
-        emotion = self.tag(text)
-        return store.insert(
-            text,
-            emotional_label = emotion["label"],
-            emotional_score = emotion["score"],
-            **insert_kwargs,
-        )
-
-    def _llm_tag(self, text: str) -> dict:
-        """Use GPT-4o-mini to classify emotion — accurate but costs tokens."""
+            t = text.lower()
+            if any(w in t for w in ("happy", "joy", "excited", "love")):
+                res = EmotionResult(label="joy", score=0.6, reasoning="Keyword match")
+                return res.model_dump() if self.mode == "keyword" else res
+            if any(w in t for w in ("scared", "afraid", "fear", "terrified")):
+                res = EmotionResult(label="fear", score=0.7, reasoning="Keyword match")
+                return res.model_dump() if self.mode == "keyword" else res
+            if any(w in t for w in ("hate", "angry", "furious", "annoyed")):
+                res = EmotionResult(label="anger", score=0.7, reasoning="Keyword match")
+                return res.model_dump() if self.mode == "keyword" else res
+            if any(w in t for w in ("sad", "depressed", "unhappy", "sorrow")):
+                res = EmotionResult(label="sadness", score=0.6, reasoning="Keyword match")
+                return res.model_dump() if self.mode == "keyword" else res
+            if "surpris" in t or "wow" in t:
+                res = EmotionResult(label="surprise", score=0.5, reasoning="Keyword match")
+                return res.model_dump() if self.mode == "keyword" else res
+            res = EmotionResult(label="neutral", score=0.0, reasoning="No emotion keywords found")
+            return res.model_dump() if self.mode == "keyword" else res
         try:
-            response = invoke_llm(
-                self.llm,
-                messages=[
-                    {"role": "user", "content": EMOTION_PROMPT.format(text=text[:500])}
-                ],
-                model=self.model,
-                temperature=0,
-                max_tokens=150,
-                openai_key=self.openai_key,
+            return self._client.chat.completions.create(
+                model          = self.model,
+                response_model = EmotionResult,
+                max_retries    = 2,
+                messages       = [{
+                    "role":    "user",
+                    "content": EMOTION_PROMPT.format(text=text[:500]),
+                }],
+                temperature = 0,
+                max_tokens  = 100,
             )
-            raw = response.strip()
-            # Strip markdown code fences if present
-            raw = re.sub(r"```json|```", "", raw).strip()
-            result = json.loads(raw)
-
-            # Validate
-            if result.get("label") not in EMOTION_LABELS:
-                result["label"] = "neutral"
-            result["score"] = float(max(0.0, min(1.0, result.get("score", 0.0))))
-            return result
-
         except Exception as e:
-            # Fallback to keyword mode on any error
-            result = self._keyword_tag(text)
-            result["reasoning"] = f"LLM error ({e}), used keyword fallback"
-            return result
+            return EmotionResult(
+                label     = "neutral",
+                score     = 0.0,
+                reasoning = f"Tagging failed: {str(e)[:80]}",
+            )
 
-    def _keyword_tag(self, text: str) -> dict:
-        """Fast keyword-based emotion detection — no API call needed."""
-        text_lower = text.lower()
-        best_label  = "neutral"
-        best_count  = 0
-
-        for label, keywords in EMOTION_KEYWORDS.items():
-            count = sum(1 for kw in keywords if kw in text_lower)
-            if count > best_count:
-                best_count  = count
-                best_label  = label
-
-        # Rough score based on keyword density
-        score = min(best_count * 0.2, 1.0) if best_count > 0 else 0.0
-
-        return {
-            "label":     best_label,
-            "score":     score,
-            "reasoning": f"Keyword match: {best_count} keywords for '{best_label}'",
-        }
-
-    def batch_tag(self, texts: list[str]) -> list[dict]:
-        """Tag a list of texts. Useful for bulk imports."""
+    def batch_tag(self, texts: list[str]) -> list[EmotionResult]:
         return [self.tag(t) for t in texts]

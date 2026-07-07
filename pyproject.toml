@@ -1,15 +1,16 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "memory-os"
 version = "0.1.0"
-description = "Brain-like memory for AI agents — Ebbinghaus forgetting curves, emotional tagging, and memory consolidation research"
+description = "Compact Qdrant-backed memory for host-owned LLM applications."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-keywords = ["ai", "memory", "agents", "rag", "vector-database", "langchain", "langgraph"]
+license-files = ["LICENSE"]
+keywords = ["ai", "memory", "rag", "vector-database", "qdrant"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -19,34 +20,16 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
-
 dependencies = [
-    "openai>=1.30",
     "qdrant-client>=1.9",
-    "langgraph>=0.1",
-    "apscheduler>=3.10",
-    "hdbscan>=0.8",
-    "numpy>=1.26",
-    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
-    "pytest-asyncio>=0.23",
     "black>=24.0",
     "ruff>=0.4",
 ]
-benchmark = [
-    "pandas>=2.0",
-    "matplotlib>=3.8",
-    "jupyter>=1.0",
-]
-
-[project.urls]
-Homepage = "https://github.com/yourusername/memory-os"
-Repository = "https://github.com/yourusername/memory-os"
-Issues = "https://github.com/yourusername/memory-os/issues"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -59,3 +42,7 @@ target-version = "py310"
 [tool.black]
 line-length = 100
 target-version = ["py310"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["memory_os*"]

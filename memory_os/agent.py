@@ -1,345 +1,251 @@
 """
-memory_os/agent.py  —  LangGraph Agent (updated with extractor)
-===============================================================
-Updated flow:
+memory_os/agent.py  —  MemoryAgent: context provider
+========================================================
+Extract, store, and retrieve relevant memories for user queries.
+Works with any LLM provider (you handle the LLM call).
 
-  user message
-    ↓
-  EXTRACT   — pull out N distinct facts from the message
-    ↓
-  RETRIEVE  — search all 3 memory layers for relevant context
-    ↓
-  GENERATE  — LLM answers using retrieved memories as context
-    ↓
-  MEMORIZE  — store extracted facts (each separately, emotion-tagged)
-    ↓
-  response
+Minimal usage (6 params):
 
-The key change from v1:
-  Before: store whole message as one blob
-  Now:    extract N facts, store each with own importance + emotion + decay
+    from memory_os import MemoryAgent
+
+    agent = MemoryAgent(
+        llm_model      = "gpt-4o-mini",       # for fact extraction
+        llm_api_key    = "sk-...",
+        embed_model    = "text-embedding-3-small",
+        embed_api_key  = "sk-...",            # often same as llm_api_key
+        qdrant_url     = "http://localhost:6333",
+        session_id     = "user_123",
+    )
+    
+    # Get relevant memories
+    contexts = agent.get_context("help with authentication")
+    print(contexts)  # List of relevant memories
+    
+    # Use with your LLM
+    formatted = "\\n".join([f"[{m['layer']}] {m['text']}" for m in contexts])
+    response = your_llm.chat(system="...", user=f"{formatted}\\n\\n{message}")
 """
 
-from typing import Any, Optional, TypedDict
-from .llm_utils import invoke_llm
+import os
+from typing import Optional
+try:
+    import litellm
+except Exception:
+    from . import _litellm as litellm
 
-SYSTEM_PROMPT = """You are a helpful AI assistant with persistent memory.
-You remember past conversations and use them to give better, more personalized responses.
+litellm.suppress_debug_info = True
 
-When relevant memories are provided, use them naturally — don't announce "I remember that..."
-Just incorporate the context as a knowledgeable friend would.
+from ._utils import set_litellm_key
 
-Be concise and helpful."""
-
-CONTEXT_TEMPLATE = """Relevant memories about this user:
-{memories}
-
-User's message: {query}"""
-
-
-class AgentState(TypedDict):
-    query:           str
-    extracted_facts: list[dict]   # what we learned from this message
-    memories:        list[dict]   # what we retrieved for context
-    context_prompt:  str
-    response:        str
-    stored_ids:      list[str]    # UUIDs of newly stored memories
+# LiteLLM is used for:
+# - Memory extraction (identifying facts from user messages)
+# - Emotion tagging (optional)
 
 
 class MemoryAgent:
     """
-    Full memory-os agent with extraction, retrieval, generation, storage.
+    Context provider for persistent user memory.
 
-    Usage:
-        agent = MemoryAgent(session_id="user_123")
-        response = agent.chat("I'm building with Next.js, help me set up auth")
-        print(response)
+    Handles memory extraction, storage, ranking, and retrieval.
+    All features intact: vector embeddings, decay, emotions, extraction.
+    
+    LiteLLM is used internally for fact extraction and emotion tagging.
+    YOU handle the LLM response generation with the contexts returned.
 
-        # With debug info
-        result = agent.chat_with_debug("same message")
-        print(result["extracted_facts"])   # what was extracted
-        print(result["memories_used"])     # what memories were retrieved
+    Required parameters:
+    ────────────────────
+    llm_model      : LiteLLM model string (e.g. "gpt-4o-mini", "claude-3-haiku-20240307")
+    llm_api_key    : API key for the LLM provider
+    embed_model    : Embedding model (e.g. "text-embedding-3-small")
+    embed_api_key  : API key for embeddings (often same as llm_api_key)
+    qdrant_url     : Qdrant URL ("http://localhost:6333" or Qdrant Cloud URL)
+    session_id     : Unique ID per user/session
+
+    Optional parameters:
+    ────────────────────
+    qdrant_api_key  : Qdrant Cloud API key (None for local Qdrant)
+    top_n_memories  : Memories injected per prompt (default: 5)
+    emotion_mode    : "llm" = tag emotions (accurate) | "off" = skip (faster)
     """
 
     def __init__(
         self,
-        session_id:      str = "default",
-        llm:             Any = None,
-        embedder:        Any = None,
-        qdrant_url:      Optional[str] = None,
+        llm_model:      str,
+        llm_api_key:    str,
+        embed_model:    str,
+        embed_api_key:  str,
+        qdrant_url:     str,
+        session_id:     str,
+        # Optional
         qdrant_api_key:  Optional[str] = None,
         top_n_memories:  int = 5,
+        emotion_mode:    str = "llm",  # "llm" = tag emotions (accurate) | "off" = skip (faster)
+        redis_url:       Optional[str] = None,
     ):
-        from .store      import MemoryStore
-        from .decay      import DecayReranker
-        from .emotion    import EmotionTagger
-        from .router     import MemoryRouter
-        from .extractor  import MemoryExtractor
+        missing = [k for k, v in {
+            "llm_model":     llm_model,
+            "llm_api_key":   llm_api_key,
+            "embed_model":   embed_model,
+            "embed_api_key": embed_api_key,
+            "qdrant_url":    qdrant_url,
+            "session_id":    session_id,
+        }.items() if not v]
+        if missing:
+            raise ValueError(
+                f"Missing required parameters: {missing}\n\n"
+                "Minimum usage:\n"
+                "    agent = MemoryAgent(\n"
+                "        llm_model     = 'gpt-4o-mini',\n"
+                "        llm_api_key   = 'sk-...',\n"
+                "        embed_model   = 'text-embedding-3-small',\n"
+                "        embed_api_key = 'sk-...',\n"
+                "        qdrant_url    = 'http://localhost:6333',\n"
+                "        session_id    = 'user_1',\n"
+                "    )"
+            )
 
+        self.llm_model      = llm_model
         self.session_id     = session_id
-        self.llm            = llm
-        self.embedder       = embedder
-        self.qdrant_url     = qdrant_url
-        self.qdrant_api_key = qdrant_api_key
         self.top_n_memories = top_n_memories
-        self.model          = "gpt-4o-mini"
 
-        # Core components
-        self.store     = MemoryStore(
-            qdrant_url     = qdrant_url,
-            qdrant_api_key = qdrant_api_key,
-            embedder       = embedder,
+        # Set API keys for litellm
+        set_litellm_key(llm_model, llm_api_key)
+        if embed_api_key != llm_api_key:
+            set_litellm_key(embed_model, embed_api_key)
+
+        # Init components
+        from .store     import MemoryStore
+        from .decay     import DecayReranker
+        from .emotion   import EmotionTagger
+        from .extractor import MemoryExtractor
+        from .router    import MemoryRouter
+
+        self.store = MemoryStore(
+            qdrant_url    = qdrant_url,
+            qdrant_key    = qdrant_api_key,
+            embed_model   = embed_model,
+            embed_api_key = embed_api_key,
         )
         self.reranker  = DecayReranker()
-        self.tagger    = EmotionTagger(llm=llm)
+        self.tagger    = EmotionTagger(model=llm_model, api_key=llm_api_key, mode=emotion_mode)
+        self.extractor = MemoryExtractor(model=llm_model, api_key=llm_api_key)
         self.router    = MemoryRouter(
             store          = self.store,
+            decay_reranker = self.reranker,
             session_id     = session_id,
+            redis_url      = redis_url,
         )
-        self.extractor = MemoryExtractor(llm=llm)
-
-        try:
-            self._graph = self._build_graph()
-        except ImportError:
-            self._graph = None
-
-    # ── LangGraph graph ───────────────────────────────────────────────────────
-
-    def _build_graph(self):
-        try:
-            from langgraph.graph import StateGraph, END
-        except ImportError:
-            raise ImportError("pip install langgraph")
-
-        graph = StateGraph(AgentState)
-
-        # 4 nodes now — extract is new
-        graph.add_node("extract",   self._node_extract)
-        graph.add_node("retrieve",  self._node_retrieve)
-        graph.add_node("generate",  self._node_generate)
-        graph.add_node("memorize",  self._node_memorize)
-
-        graph.set_entry_point("extract")
-        graph.add_edge("extract",  "retrieve")
-        graph.add_edge("retrieve", "generate")
-        graph.add_edge("generate", "memorize")
-        graph.add_edge("memorize", END)
-
-        return graph.compile()
-
-    # ── Nodes ─────────────────────────────────────────────────────────────────
-
-    def _node_extract(self, state: AgentState) -> AgentState:
-        """
-        Node 1 — Extract distinct facts from the user's message.
-
-        "I'm building with Next.js, hate Firebase, 3 week deadline"
-        becomes:
-        [
-          {text: "User builds with Next.js", importance: 0.9, type: "semantic"},
-          {text: "User hates Firebase",       importance: 0.8, type: "semantic"},
-          {text: "User has 3 week deadline",  importance: 0.7, type: "episodic"},
-        ]
-        """
-        facts = self.extractor.extract(state["query"])
-        return {**state, "extracted_facts": facts}
-
-    def _node_retrieve(self, state: AgentState) -> AgentState:
-        """
-        Node 2 — Retrieve relevant memories for this query.
-        Also pushes raw message to working memory.
-        """
-        query    = state["query"]
-        memories = self.router.query(query, top_n=self.top_n_memories)
-
-        # Push to working memory (raw message, not extracted)
-        self.router.push_to_working(query, role="user")
-
-        # Build context prompt
-        if memories:
-            mem_lines = "\n".join(
-                f"[{m['layer']}] {m['text']}" for m in memories
-            )
-            context = CONTEXT_TEMPLATE.format(
-                memories=mem_lines,
-                query=query,
-            )
-        else:
-            context = query
-
-        return {**state, "memories": memories, "context_prompt": context}
-
-    def _node_generate(self, state: AgentState) -> AgentState:
-        """Node 3 — Generate response using LLM + retrieved memories."""
-        reply = invoke_llm(
-            self.llm,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": state["context_prompt"]},
-            ],
-            model=self.model,
-            temperature=0.7,
-            max_tokens=500,
-        )
-        self.router.push_to_working(reply, role="assistant")
-        return {**state, "response": reply}
-
-    def _node_memorize(self, state: AgentState) -> AgentState:
-        """
-        Node 4 — Store extracted facts as separate memories.
-
-        Each fact gets:
-        - Its own importance score (from extractor)
-        - Its own emotion tag (from tagger, per-fact not per-message)
-        - Its own Ebbinghaus decay rate (based on above two)
-        - Its own memory_type (episodic or semantic)
-        """
-        stored_ids = []
-
-        if state["extracted_facts"]:
-            # Store each extracted fact individually
-            ids = self.extractor.extract_and_store(
-                text   = state["query"],
-                store  = self.store,
-                tagger = self.tagger,
-                source = f"session:{self.session_id}",
-            )
-            stored_ids.extend(ids)
-        else:
-            # Fallback: if nothing extracted, store the whole message
-            # (handles short messages, greetings, etc.)
-            emotion = self.tagger.tag(state["query"])
-            mid = self.store.insert(
-                text            = f"User said: {state['query']}",
-                importance      = 0.3,
-                memory_type     = "episodic",
-                emotional_score = emotion["score"],
-                emotional_label = emotion["label"],
-                source          = f"session:{self.session_id}",
-            )
-            stored_ids.append(mid)
-
-        return {**state, "stored_ids": stored_ids}
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def chat(self, query: str) -> str:
-        """Send message, get response. Memories handled automatically."""
-        if self._graph:
-            final = self._graph.invoke({
-                "query":           query,
-                "extracted_facts": [],
-                "memories":        [],
-                "context_prompt":  "",
-                "response":        "",
-                "stored_ids":      [],
-            })
-            return final["response"]
-        return self._simple_chat(query)
-
-    def get_context(self, prompt: str) -> dict:
-        """Return a context prompt and retrieved memories for a given prompt.
-
-        This is a read-only retrieval: it does NOT update access metadata
-        or push the prompt into working memory.
-        Returns: {"context_prompt": str, "memories": list[dict]}
+    def get_context(self, message: str, recent_n: int | None = None) -> list[dict]:
         """
-        memories = self.router.query(prompt, top_n=self.top_n_memories)
+        Get relevant memories for a user query (context provider).
+        
+        Extracts facts, retrieves ranked memories, and stores the interaction.
+        You handle the LLM call with this context.
 
-        if memories:
-            mem_lines = "\n".join(f"[{m.get('layer','episodic')}] {m.get('text','')}" for m in memories)
-            context = CONTEXT_TEMPLATE.format(memories=mem_lines, query=prompt)
-        else:
-            context = prompt
+        Args:
+            message: User query/message
+            
+        Returns:
+            list[dict]: Relevant memories ranked by relevance. Each contains:
+                - text: Memory content
+                - layer: Memory type (semantic/episodic/semantic)
+                - importance: Score 0-1
+                - emotional_label: Emotion tag (if emotion_mode="llm")
 
-        return {"context_prompt": context, "memories": memories}
-
-    def store_interaction(self, prompt: str, response: str) -> list[str]:
-        """Store a user-agent interaction.
-
-        - Pushes `prompt` and `response` to working memory (last-15 window).
-        - Extracts facts from `prompt` and stores them using the extractor/tagger/store.
-        Returns list of stored memory UUIDs.
-        """
-        # Push to working memory
-        try:
-            self.router.push_to_working(prompt, role="user")
-            self.router.push_to_working(response, role="assistant")
-        except Exception:
-            # Best-effort: continue even if working memory is unavailable
-            pass
-
-        # Extract and store facts from the user's prompt
-        stored_ids = []
-        try:
-            stored_ids = self.extractor.extract_and_store(
-                text=prompt,
-                store=self.store,
-                tagger=self.tagger,
-                source=f"session:{self.session_id}",
+        Usage:
+            contexts = agent.get_context("help with authentication")
+            formatted = "\n".join([f"[{m['layer']}] {m['text']}" for m in contexts])
+            
+            # Use with your LLM
+            response = my_llm.chat(
+                system="You are helpful.",
+                user=f"{formatted}\n\nUser's message: {message}"
             )
-        except Exception:
-            # Don't fail the caller if storage/extraction has issues
-            stored_ids = []
-
-        return stored_ids
-
-    def chat_with_debug(self, query: str) -> dict:
         """
-        Like chat() but returns full pipeline info.
-        Shows exactly what was extracted, what memories were used,
-        and what was stored. Perfect for debugging + benchmark.
+        facts    = self.extractor.extract(message)
+        memories = self.router.query(message, top_n=self.top_n_memories)
+
+        # Optionally include recent user/assistant pairs from working memory
+        if recent_n and recent_n > 0:
+            pairs = self.router.get_recent_pairs(recent_n)
+            paired_memories = []
+            for p in pairs:
+                text = f"User: {p['user']}\nAssistant: {p['assistant']}"
+                paired_memories.append({"text": text, "score": 0.9, "layer": "working_pair"})
+            memories = paired_memories + memories
+
+        # Do NOT store facts or interactions here — caller will call
+        # `store()` after getting the LLM response.
+        return memories
+        
+    def store(
+        self,
+        message: str,
+        response: str,
+        extraction_result = None,
+        source: str = "interaction",
+    ) -> dict:
+        """Public method to store a completed interaction.
+
+        Call this after you have used `get_context()` and obtained an LLM
+        response. This will:
+          - push the user message and assistant response into working memory
+          - extract and store facts from the user message
+          - store the query/response pair as memories
+
+        Returns a dict with `fact_ids` and `interaction_ids`.
         """
-        final = self._graph.invoke({
-            "query":           query,
-            "extracted_facts": [],
-            "memories":        [],
-            "context_prompt":  "",
-            "response":        "",
-            "stored_ids":      [],
-        })
-        return {
-            "response":        final["response"],
-            "extracted_facts": final["extracted_facts"],  # what we learned
-            "memories_used":   final["memories"],         # what we retrieved
-            "stored_ids":      final["stored_ids"],       # new memory UUIDs
-            "query":           query,
-        }
+        facts = extraction_result if extraction_result is not None else self.extractor.extract(message)
 
-    def end_session(self) -> None:
-        """Flush working memory at end of session."""
-        self.router.flush_working()
-
-    def _simple_chat(self, query: str) -> str:
-        """Fallback without LangGraph."""
-        facts    = self.extractor.extract(query)
-        memories = self.router.query(query, top_n=self.top_n_memories)
-        mem_lines = "\n".join(f"- {m['text']}" for m in memories)
-        context  = CONTEXT_TEMPLATE.format(
-            memories=mem_lines, query=query
-        ) if memories else query
-
-        reply = invoke_llm(
-            self.llm,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": context},
-            ],
-            model=self.model,
-            temperature=0.7,
-            max_tokens=500,
-        )
+        # Push both to working memory (user then assistant)
+        self.router.push_to_working(message, role="user")
+        self.router.push_to_working(response, role="assistant")
 
         # Store extracted facts
-        if facts:
-            for fact in facts:
-                emotion = self.tagger.tag(fact["text"])
-                self.store.insert(
-                    text            = fact["text"],
-                    importance      = fact["importance"],
-                    memory_type     = fact["memory_type"],
-                    emotional_score = emotion["score"],
-                    emotional_label = emotion["label"],
-                    source          = f"session:{self.session_id}",
-                )
-        return reply
+        fact_ids = []
+        if getattr(facts, "has_facts", False):
+            fact_ids = self.extractor.extract_and_store(
+                text=message,
+                store=self.store,
+                user_id=self.session_id,
+                source=f"session:{self.session_id}",
+                _result=facts,
+            )
+
+        # Store the query/response pair
+        interaction_ids = self.store.store_interaction(
+            user_id = self.session_id,
+            query = message,
+            response = response,
+            source = f"session:{self.session_id}",
+        )
+
+        return {"fact_ids": fact_ids, "interaction_ids": interaction_ids}
+
+    # ── Internals ─────────────────────────────────────────────────────────────
+
+    def _store_facts(self, message: str, extraction_result) -> list[str]:
+        """Store extracted facts with emotion tags."""
+        if getattr(extraction_result, "has_facts", False):
+            return self.extractor.extract_and_store(
+                text    = message,
+                store   = self.store,
+                user_id = self.session_id,
+                source  = f"session:{self.session_id}",
+                _result = extraction_result,
+            )
+        else:
+            emotion = self.tagger.tag(message)
+            mid = self.store.insert(
+                user_id         = self.session_id,
+                text            = f"User said: {message}",
+                importance      = 0.3,
+                memory_type     = "episodic",
+                emotional_score = emotion.score,
+                emotional_label = emotion.label,
+                source          = f"session:{self.session_id}",
+            )
+            return [mid]
