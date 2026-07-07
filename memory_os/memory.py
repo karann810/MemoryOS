@@ -367,14 +367,14 @@ class MemoryOS:
         except UnexpectedResponse:
             return False
 
-    def _session_filter(self) -> Filter:
+    def _session_filter(self):
         return Filter(
             must=[
                 FieldCondition(key="session_id", match=MatchValue(value=self.session_id)),
             ]
         )
 
-    def _pair_filter(self, pair_id: str) -> Filter:
+    def _pair_filter(self, pair_id: str):
         return Filter(
             must=[
                 FieldCondition(key="session_id", match=MatchValue(value=self.session_id)),
