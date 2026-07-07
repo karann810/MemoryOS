@@ -58,6 +58,7 @@ class FakeQdrantClient:
         self.api_key = api_key
         self.exists = False
         self.points = []
+        self.indexed_fields = []
 
     def collection_exists(self, collection_name):
         return self.exists
@@ -65,31 +66,34 @@ class FakeQdrantClient:
     def create_collection(self, collection_name, vectors_config):
         self.exists = True
 
+    def create_payload_index(self, collection_name, field_name, field_schema):
+        self.indexed_fields.append((field_name, field_schema))
+
     def upsert(self, collection_name, points):
         self.points.extend(points)
 
-    def query_points(self, collection_name, query, query_filter, limit, with_payload):
-        session_id = query_filter.must[0].match.value
-        matches = [
-            SimpleNamespace(id=p.id, payload=p.payload, score=1.0)
-            for p in self.points
-            if p.payload["session_id"] == session_id
-        ]
+    def query_points(self, collection_name, query, query_filter=None, limit=10, with_payload=True):
+        matches = [SimpleNamespace(id=p.id, payload=p.payload, score=1.0) for p in self.points]
+        if query_filter is not None:
+            session_id = query_filter.must[0].match.value
+            matches = [point for point in matches if point.payload["session_id"] == session_id]
         return SimpleNamespace(points=matches[:limit])
 
     def scroll(self, collection_name, scroll_filter, limit, with_payload, with_vectors):
-        must = scroll_filter.must
-        session_id = must[0].match.value
-        pair_id = must[1].match.value if len(must) > 1 else None
-        matches = []
-        for point in self.points:
-            payload = point.payload
-            if payload["session_id"] != session_id:
-                continue
-            if pair_id and payload.get("pair_id") != pair_id:
-                continue
-            matches.append(point)
-        return matches[:limit], None
+        points = self.points
+        if scroll_filter is not None:
+            must = scroll_filter.must
+            session_id = must[0].match.value
+            pair_id = must[1].match.value if len(must) > 1 else None
+            points = []
+            for point in self.points:
+                payload = point.payload
+                if payload["session_id"] != session_id:
+                    continue
+                if pair_id is not None and payload.get("pair_id") != pair_id:
+                    continue
+                points.append(point)
+        return points[:limit], None
 
     def delete(self, collection_name, points_selector):
         doomed = set(points_selector.points)
@@ -145,6 +149,8 @@ def test_store_extracts_multiple_memories_with_metadata(monkeypatch):
     assert first_payload["emotion"] == "joy"
     assert first_payload["emotional_weight"] > 1.0
     assert first_payload["decay_score"] == 1.0
+    assert ("session_id", "keyword") in client.indexed_fields
+    assert ("pair_id", "keyword") in client.indexed_fields
 
 
 def test_retrieve_updates_decay_state_and_returns_scores(monkeypatch):

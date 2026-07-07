@@ -134,6 +134,7 @@ class MemoryOS:
         self.collection = COLLECTION_NAME
         self._client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key or None)
         self._collection_ready = False
+        self._payload_indexes_ready = False
         self._session_pairs.setdefault(session_id, [])
         self._embedder = SentenceTransformer(DEFAULT_EMBEDDING_MODEL)
 
@@ -309,13 +310,24 @@ class MemoryOS:
     def _delete_pair_memories(self, pair_id: str) -> None:
         if not self._collection_exists():
             return
-        points, _ = self._client.scroll(
-            collection_name=self.collection,
-            scroll_filter=self._pair_filter(pair_id),
-            limit=100,
-            with_payload=True,
-            with_vectors=False,
-        )
+        scroll_filter = self._pair_filter(pair_id)
+        try:
+            points, _ = self._client.scroll(
+                collection_name=self.collection,
+                scroll_filter=scroll_filter,
+                limit=1000,
+                with_payload=True,
+                with_vectors=False,
+            )
+        except TypeError:
+            points, _ = self._client.scroll(
+                collection_name=self.collection,
+                scroll_filter=None,
+                limit=1000,
+                with_payload=True,
+                with_vectors=False,
+            )
+            points = self._filter_points(points, pair_id=pair_id)
         if not points:
             return
         self._client.delete(
@@ -351,6 +363,26 @@ class MemoryOS:
                 vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
             )
         self._collection_ready = True
+        self._ensure_payload_indexes()
+
+    def _ensure_payload_indexes(self) -> None:
+        if self._payload_indexes_ready:
+            return
+        if hasattr(self._client, "create_payload_index"):
+            try:
+                self._client.create_payload_index(
+                    collection_name=self.collection,
+                    field_name="session_id",
+                    field_schema="keyword",
+                )
+                self._client.create_payload_index(
+                    collection_name=self.collection,
+                    field_name="pair_id",
+                    field_schema="keyword",
+                )
+            except Exception:
+                pass
+        self._payload_indexes_ready = True
 
     def _collection_exists(self) -> bool:
         try:
@@ -379,21 +411,51 @@ class MemoryOS:
     def _search(self, vector: list[float], limit: int):
         query_filter = self._session_filter()
         if hasattr(self._client, "query_points"):
-            result = self._client.query_points(
-                collection_name=self.collection,
-                query=vector,
-                query_filter=query_filter,
-                limit=limit,
-                with_payload=True,
-            )
-            return getattr(result, "points", result)
-        return self._client.search(
-            collection_name=self.collection,
-            query_vector=vector,
-            query_filter=query_filter,
-            limit=limit,
-            with_payload=True,
-        )
+            try:
+                result = self._client.query_points(
+                    collection_name=self.collection,
+                    query=vector,
+                    query_filter=query_filter,
+                    limit=limit,
+                    with_payload=True,
+                )
+                return getattr(result, "points", result)
+            except TypeError:
+                result = self._client.query_points(
+                    collection_name=self.collection,
+                    query=vector,
+                    limit=limit,
+                    with_payload=True,
+                )
+                points = getattr(result, "points", result)
+        else:
+            try:
+                return self._client.search(
+                    collection_name=self.collection,
+                    query_vector=vector,
+                    query_filter=query_filter,
+                    limit=limit,
+                    with_payload=True,
+                )
+            except TypeError:
+                points = self._client.search(
+                    collection_name=self.collection,
+                    query_vector=vector,
+                    limit=limit,
+                    with_payload=True,
+                )
+        return self._filter_points(points)
+
+    def _filter_points(self, points: list[Any], pair_id: str | None = None) -> list[Any]:
+        filtered = []
+        for point in points:
+            payload = getattr(point, "payload", None) or {}
+            if payload.get("session_id") != self.session_id:
+                continue
+            if pair_id is not None and payload.get("pair_id") != pair_id:
+                continue
+            filtered.append(point)
+        return filtered
 
     def _set_payload(self, point_id: str, payload: dict[str, Any]) -> None:
         if hasattr(self._client, "set_payload"):
