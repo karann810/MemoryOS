@@ -14,6 +14,11 @@ import uuid
 from typing import Any
 
 try:
+    from sklearn.cluster import AgglomerativeClustering
+except Exception:
+    AgglomerativeClustering = None
+
+try:
     from qdrant_client import QdrantClient
     from qdrant_client.http.exceptions import UnexpectedResponse
     from qdrant_client.models import (
@@ -51,6 +56,8 @@ SECONDS_PER_DAY = 86400.0
 DEFAULT_STABILITY = 2.0
 STABILITY_GROWTH = 0.75
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+CONSOLIDATION_DISTANCE_THRESHOLD = 0.15
 
 EMOTION_WEIGHTS = {
     "joy": 1.15,
@@ -92,25 +99,32 @@ User prompt:
 {prompt}
 """
 
+CONSOLIDATION_PROMPT = """You merge several memory texts into one concise summary.
+
+Preserve every distinct fact from the list below, but return only one clear
+plain-text memory item that captures the important details without JSON.
+
+Memory texts:
+{memory_texts}
+"""
+
 
 class MemoryOS:
     """Small public API: store prompt memories, retrieve context."""
 
-    _session_pairs: dict[str, list[dict[str, Any]]] = {}
+    _user_pairs: dict[str, list[dict[str, Any]]] = {}
 
     def __init__(
         self,
         qdrant_url: str,
         qdrant_api_key: str,
         llm: Any,
-        session_id: str,
     ) -> None:
         missing = [
             name
             for name, value in {
                 "qdrant_url": qdrant_url,
                 "llm": llm,
-                "session_id": session_id,
             }.items()
             if not value
         ]
@@ -130,12 +144,10 @@ class MemoryOS:
         self.qdrant_url = qdrant_url
         self.qdrant_api_key = qdrant_api_key
         self.llm = llm
-        self.session_id = session_id
         self.collection = COLLECTION_NAME
         self._client = QdrantClient(url=qdrant_url, api_key=qdrant_api_key or None)
         self._collection_ready = False
         self._payload_indexes_ready = False
-        self._session_pairs.setdefault(session_id, [])
         self._embedder = SentenceTransformer(DEFAULT_EMBEDDING_MODEL)
 
         # Eagerly create the collection + payload indexes now, instead of
@@ -145,10 +157,17 @@ class MemoryOS:
         vector_size = self._embedder.get_sentence_embedding_dimension()
         self._ensure_collection(vector_size)
 
-    def store(self, prompt: str, response: str) -> None:
-        """Extract prompt memories into Qdrant and keep the raw pair in session history."""
+    def store(
+        self,
+        prompt: str,
+        response: str,
+        user_id: str | None = None,
+    ) -> None:
+        """Extract prompt memories into Qdrant and keep the raw pair in user-scoped history."""
         if not prompt or not response:
             return
+
+        effective_user_id = user_id or ""
 
         pair_id = str(uuid.uuid4())
         now = time.time()
@@ -168,7 +187,7 @@ class MemoryOS:
                         id=str(uuid.uuid4()),
                         vector=vector,
                         payload={
-                            "session_id": self.session_id,
+                            "user_id": effective_user_id,
                             "pair_id": pair_id,
                             "text": memory["text"],
                             "created_at": now,
@@ -186,14 +205,28 @@ class MemoryOS:
                 )
             self._client.upsert(collection_name=self.collection, points=points)
 
-        self._remember_pair(pair_id=pair_id, prompt=prompt, response=response, created_at=now)
+        self._remember_pair(
+            pair_id=pair_id,
+            prompt=prompt,
+            response=response,
+            created_at=now,
+            user_id=effective_user_id,
+        )
 
-    def retrieve(self, prompt: str) -> dict:
-        """Return decay-ranked Qdrant memories plus recent prompt/response pairs."""
+    def retrieve(self, prompt: str, user_id: str | None = None) -> dict:
+        """Return decay-ranked Qdrant memories plus recent prompt/response pairs.
+
+        Optional `user_id` scopes the read to a distinct user memory namespace.
+        """
         memories: list[dict[str, Any]] = []
+        effective_user_id = user_id or ""
         if prompt and self._collection_exists():
             vector = self._embed(prompt)
-            results = self._search(vector, limit=RETRIEVE_LIMIT)
+            results = self._search(
+                vector,
+                limit=RETRIEVE_LIMIT,
+                user_id=effective_user_id,
+            )
             reranked = self._rerank_hits(results)
             for hit, payload in reranked[:RETURN_MEMORY_LIMIT]:
                 memories.append(
@@ -208,9 +241,155 @@ class MemoryOS:
                 )
 
         return {
-            "recent_pairs": self._recent_pairs(),
+            "recent_pairs": self._recent_pairs(effective_user_id),
             "memories": memories,
         }
+
+    def consolidate(self, user_id: str) -> dict:
+        """Cluster and merge semantically-similar user memories into one summary point."""
+        if not self._collection_exists():
+            return {"clusters_merged": 0, "points_removed": 0}
+
+        points = self._scroll_user_points_with_vectors(user_id)
+        if len(points) < 2:
+            return {"clusters_merged": 0, "points_removed": 0}
+
+        if AgglomerativeClustering is None:
+            raise ImportError(
+                "MemoryOS consolidation requires scikit-learn. Install package dependencies before use."
+            )
+
+        vectors = [self._point_vector(point) for point in points]
+        if not vectors:
+            return {"clusters_merged": 0, "points_removed": 0}
+
+        labels = AgglomerativeClustering(
+            n_clusters=None,
+            distance_threshold=CONSOLIDATION_DISTANCE_THRESHOLD,
+            linkage="average",
+            metric="cosine",
+        ).fit_predict(vectors)
+
+        groups: dict[int, list[Any]] = {}
+        for point, label in zip(points, labels):
+            groups.setdefault(int(label), []).append(point)
+
+        clusters_merged = 0
+        points_removed = 0
+        for cluster in groups.values():
+            if len(cluster) == 1:
+                continue
+            if len(cluster) < 2:
+                continue
+
+            texts = [self._point_text(point) for point in cluster]
+            merged_text = self._response_text(
+                self.llm.invoke(CONSOLIDATION_PROMPT.format(memory_texts="\n".join(texts)))
+            ).strip()
+            if not merged_text:
+                merged_text = " ".join(texts)
+
+            merged_vector = self._embed(merged_text)
+            highest_importance_point = max(
+                cluster,
+                key=lambda point: float((getattr(point, "payload", None) or {}).get("importance", 0.0)),
+            )
+            highest_importance_payload = getattr(highest_importance_point, "payload", None) or {}
+            emotion = str(highest_importance_payload.get("emotion", "neutral")).strip().lower()
+            if emotion not in EMOTION_WEIGHTS:
+                emotion = "neutral"
+
+            merged_importance = max(
+                float((getattr(point, "payload", None) or {}).get("importance", 0.0))
+                for point in cluster
+            )
+            merged_emotional_weight = EMOTION_WEIGHTS[emotion]
+
+            merged_payload = {
+                "user_id": user_id,
+                "text": merged_text,
+                "importance": merged_importance,
+                "access_count": sum(
+                    int((getattr(point, "payload", None) or {}).get("access_count", 0))
+                    for point in cluster
+                ),
+                "created_at": min(
+                    float((getattr(point, "payload", None) or {}).get("created_at", time.time()))
+                    for point in cluster
+                ),
+                "last_accessed": max(
+                    float((getattr(point, "payload", None) or {}).get("last_accessed", time.time()))
+                    for point in cluster
+                ),
+                "emotion": emotion,
+                "emotional_weight": merged_emotional_weight,
+                "stability": DEFAULT_STABILITY,
+                "decay_score": 1.0,
+                "final_score": merged_importance * merged_emotional_weight,
+                "pair_id": None,
+                # Merged points intentionally fall outside the pair-based eviction lifecycle
+                # because they are no longer tied to one prompt/response pair.
+                "merged_from": len(cluster),
+            }
+
+            point = PointStruct(
+                id=str(uuid.uuid4()),
+                vector=merged_vector,
+                payload=merged_payload,
+            )
+            self._client.upsert(collection_name=self.collection, points=[point])
+            self._client.delete(
+                collection_name=self.collection,
+                points_selector=PointIdsList(points=[original.id for original in cluster]),
+            )
+
+            clusters_merged += 1
+            points_removed += len(cluster)
+
+        return {"clusters_merged": clusters_merged, "points_removed": points_removed}
+
+    def _scroll_user_points_with_vectors(self, user_id: str) -> list[Any]:
+        if not self._collection_exists():
+            return []
+
+        scroll_filter = self._user_filter(user_id)
+        try:
+            points, _ = self._client.scroll(
+                collection_name=self.collection,
+                scroll_filter=scroll_filter,
+                limit=1000,
+                with_payload=True,
+                with_vectors=True,
+            )
+        except TypeError:
+            points, _ = self._client.scroll(
+                collection_name=self.collection,
+                scroll_filter=None,
+                limit=1000,
+                with_payload=True,
+                with_vectors=True,
+            )
+            points = [point for point in points if getattr(point, "payload", {}).get("user_id") == user_id]
+        return [point for point in points if getattr(point, "payload", {}).get("user_id") == user_id]
+
+    @staticmethod
+    def _point_text(point: Any) -> str:
+        payload = getattr(point, "payload", None) or {}
+        return str(payload.get("text", "")).strip()
+
+    @staticmethod
+    def _point_vector(point: Any) -> list[float]:
+        vector = getattr(point, "vector", None)
+        if vector is None:
+            vector = getattr(point, "vectors", None)
+        if isinstance(vector, dict):
+            for value in vector.values():
+                if isinstance(value, list):
+                    vector = value
+                    break
+        if isinstance(vector, list):
+            return [float(value) for value in vector]
+        return []
 
     def _extract_memories(self, prompt: str) -> list[dict[str, Any]]:
         llm_response = self.llm.invoke(EXTRACTION_PROMPT.format(prompt=prompt.strip()))
@@ -298,26 +477,35 @@ class MemoryOS:
         )
         return payload
 
-    def _remember_pair(self, pair_id: str, prompt: str, response: str, created_at: float) -> None:
-        session_pairs = self._session_pairs.setdefault(self.session_id, [])
-        session_pairs.append(
+    def _remember_pair(
+        self,
+        pair_id: str,
+        prompt: str,
+        response: str,
+        created_at: float,
+        user_id: str | None = None,
+    ) -> None:
+        effective_user_id = user_id or ""
+        user_pairs = self._user_pairs.setdefault(effective_user_id, [])
+        user_pairs.append(
             {
                 "pair_id": pair_id,
                 "prompt": prompt,
                 "response": response,
                 "created_at": created_at,
+                "user_id": effective_user_id,
             }
         )
-        if len(session_pairs) <= SESSION_PAIR_CAP:
+        if len(user_pairs) <= SESSION_PAIR_CAP:
             return
 
-        evicted = session_pairs.pop(0)
-        self._delete_pair_memories(evicted["pair_id"])
+        evicted = user_pairs.pop(0)
+        self._delete_pair_memories(effective_user_id, evicted["pair_id"])
 
-    def _delete_pair_memories(self, pair_id: str) -> None:
+    def _delete_pair_memories(self, user_id: str, pair_id: str) -> None:
         if not self._collection_exists():
             return
-        scroll_filter = self._pair_filter(pair_id)
+        scroll_filter = self._pair_filter(user_id, pair_id)
         try:
             points, _ = self._client.scroll(
                 collection_name=self.collection,
@@ -334,7 +522,7 @@ class MemoryOS:
                 with_payload=True,
                 with_vectors=False,
             )
-            points = self._filter_points(points, pair_id=pair_id)
+            points = self._filter_points(points, pair_id=pair_id, user_id=user_id)
         if not points:
             return
         self._client.delete(
@@ -342,8 +530,9 @@ class MemoryOS:
             points_selector=PointIdsList(points=[point.id for point in points]),
         )
 
-    def _recent_pairs(self) -> list[dict]:
-        pairs = self._session_pairs.get(self.session_id, [])
+    def _recent_pairs(self, user_id: str | None = None) -> list[dict]:
+        effective_user_id = user_id or ""
+        pairs = self._user_pairs.get(effective_user_id, [])
         recent = pairs[-RECENT_PAIR_LIMIT:]
         return [
             {
@@ -379,7 +568,7 @@ class MemoryOS:
             try:
                 self._client.create_payload_index(
                     collection_name=self.collection,
-                    field_name="session_id",
+                    field_name="user_id",
                     field_schema="keyword",
                 )
                 self._client.create_payload_index(
@@ -406,23 +595,23 @@ class MemoryOS:
         except UnexpectedResponse:
             return False
 
-    def _session_filter(self):
+    def _user_filter(self, user_id: str):
         return Filter(
             must=[
-                FieldCondition(key="session_id", match=MatchValue(value=self.session_id)),
+                FieldCondition(key="user_id", match=MatchValue(value=user_id)),
             ]
         )
 
-    def _pair_filter(self, pair_id: str):
+    def _pair_filter(self, user_id: str, pair_id: str):
         return Filter(
             must=[
-                FieldCondition(key="session_id", match=MatchValue(value=self.session_id)),
+                FieldCondition(key="user_id", match=MatchValue(value=user_id)),
                 FieldCondition(key="pair_id", match=MatchValue(value=pair_id)),
             ]
         )
 
-    def _search(self, vector: list[float], limit: int):
-        query_filter = self._session_filter()
+    def _search(self, vector: list[float], limit: int, user_id: str | None = None) -> list[Any]:
+        query_filter = self._user_filter(user_id or "")
         if hasattr(self._client, "query_points"):
             try:
                 result = self._client.query_points(
@@ -457,13 +646,19 @@ class MemoryOS:
                     limit=limit,
                     with_payload=True,
                 )
-        return self._filter_points(points)
+        return self._filter_points(points, user_id=user_id)
 
-    def _filter_points(self, points: list[Any], pair_id: str | None = None) -> list[Any]:
+    def _filter_points(
+        self,
+        points: list[Any],
+        pair_id: str | None = None,
+        user_id: str | None = None,
+    ) -> list[Any]:
+        effective_user_id = user_id or ""
         filtered = []
         for point in points:
             payload = getattr(point, "payload", None) or {}
-            if payload.get("session_id") != self.session_id:
+            if payload.get("user_id") != effective_user_id:
                 continue
             if pair_id is not None and payload.get("pair_id") != pair_id:
                 continue
@@ -498,6 +693,7 @@ class MemoryOS:
         emotion = str(value or "neutral").strip().lower()
         return emotion if emotion in EMOTION_WEIGHTS else "neutral"
 
+    @staticmethod
     @staticmethod
     def _response_text(response: Any) -> str:
         if response is None:
