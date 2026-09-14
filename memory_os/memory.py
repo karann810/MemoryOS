@@ -112,7 +112,7 @@ Memory texts:
 class MemoryOS:
     """Small public API: store prompt memories, retrieve context."""
 
-    _user_pairs: dict[str, list[dict[str, Any]]] = {}
+    # _user_pairs: dict[str, list[dict[str, Any]]] = {}
 
     def __init__(
         self,
@@ -150,11 +150,18 @@ class MemoryOS:
         self._payload_indexes_ready = False
         self._embedder = SentenceTransformer(DEFAULT_EMBEDDING_MODEL)
 
+        self._user_pairs: dict[str, list[dict[str, Any]]] = {}
+
         # Eagerly create the collection + payload indexes now, instead of
         # waiting for the first successful .store() call. This guarantees
         # .retrieve() never hits a "missing index" 400 error, even if it's
         # called before any .store(), or in a fresh process/kernel.
-        vector_size = self._embedder.get_sentence_embedding_dimension()
+
+        embedding = self._embedder.encode("Hello world")
+
+# Check the shape of the vector
+        vector_size = embedding.shape[0]
+        # vector_size = self._embedder.get_sentence_embedding_dimension()
         self._ensure_collection(vector_size)
 
     def store(
@@ -215,7 +222,6 @@ class MemoryOS:
 
     def retrieve(self, prompt: str, user_id: str | None = None) -> dict:
         """Return decay-ranked Qdrant memories plus recent prompt/response pairs.
-
         Optional `user_id` scopes the read to a distinct user memory namespace.
         """
         memories: list[dict[str, Any]] = []
@@ -586,6 +592,9 @@ class MemoryOS:
                 print(f"[MemoryOS] Warning: failed to create payload index: {exc}")
         self._payload_indexes_ready = True
 
+#done just returns true if collection exists, false if not. If the collection does not exist, 
+# we will create it in _ensure_collection
+
     def _collection_exists(self) -> bool:
         try:
             return self._client.collection_exists(self.collection)
@@ -622,14 +631,13 @@ class MemoryOS:
                     with_payload=True,
                 )
                 return getattr(result, "points", result)
-            except TypeError:
-                result = self._client.query_points(
-                    collection_name=self.collection,
-                    query=vector,
-                    limit=limit,
-                    with_payload=True,
-                )
-                points = getattr(result, "points", result)
+            except TypeError as e:
+        # 2. DO NOT fall back to a filterless search. 
+        # Instead, raise a secure error so you can see exactly what is wrong with the filter format.
+                raise ValueError(
+            f"CRITICAL: Query filter type mismatch. To prevent multi-user leak, "
+            f"search was blocked. Original error: {e}"
+        ) from e
         else:
             try:
                 return self._client.search(
@@ -639,14 +647,12 @@ class MemoryOS:
                     limit=limit,
                     with_payload=True,
                 )
-            except TypeError:
-                points = self._client.search(
-                    collection_name=self.collection,
-                    query_vector=vector,
-                    limit=limit,
-                    with_payload=True,
-                )
-        return self._filter_points(points, user_id=user_id)
+            except TypeError as e:
+                raise ValueError(
+                    f"CRITICAL: Search filter type mismatch. To prevent multi-user leak, "
+                    f"search was blocked. Original error: {e}"
+                ) from e
+        # return self._filter_points(points, user_id=user_id)
 
     def _filter_points(
         self,
@@ -693,7 +699,7 @@ class MemoryOS:
         emotion = str(value or "neutral").strip().lower()
         return emotion if emotion in EMOTION_WEIGHTS else "neutral"
 
-    @staticmethod
+    # @staticmethod
     @staticmethod
     def _response_text(response: Any) -> str:
         if response is None:
