@@ -1,5 +1,7 @@
 # memory-os
 
+![CI](https://github.com/karann810/MemoryOS/actions/workflows/ci.yml/badge.svg)
+
 Compact Qdrant-backed memory for AI applications.
 
 MemoryOS does not generate final answers. Your application owns the chat flow and
