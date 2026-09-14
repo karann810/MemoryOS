@@ -113,7 +113,6 @@ Memory texts:
 class MemoryOS:
     """Small public API: store prompt memories, retrieve context."""
 
-    _user_pairs: dict[str, list[dict[str, Any]]] = {}
 
     def __init__(
         self,
@@ -151,9 +150,7 @@ class MemoryOS:
         self._payload_indexes_ready = False
         self._embedder = SentenceTransformer(DEFAULT_EMBEDDING_MODEL)
 
-        self._user_pairs: dict[str, list[dict[str, Any]]] = self._user_pairs
-        self._store_counts: dict[str, int] = {}
-
+        self._user_pairs: dict[str, list[dict[str, Any]]] = {}
         # Eagerly create the collection + payload indexes now, instead of
         # waiting for the first successful .store() call. This guarantees
         # .retrieve() never hits a "missing index" 400 error, even if it's

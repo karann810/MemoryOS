@@ -67,7 +67,7 @@ if result.get("consolidation_recommended"):
   effective user namespace.
 - `retrieve(prompt, user_id=None)` reranks Qdrant hits using an Ebbinghaus-style decay score:
   `similarity * decay_score * importance * emotional_weight`.
-- `retrieve(prompt, user_id=None)` also returns the latest 4-5 stored prompt/response pairs for
+- `retrieve(prompt, user_id=None)` also returns the latest 4-5 stored prompt/response pairs
   the same user namespace as immediate context.
 - `consolidate(user_id)` is an explicit helper that scrolls Qdrant points for
   one user namespace with vectors, clusters similar points using cosine
@@ -105,7 +105,8 @@ if result.get("consolidation_recommended"):
 ## Boundaries
 
 - MemoryOS never generates the final answer to a user query.
-- MemoryOS uses `llm.invoke()` only to break the user's prompt into storable memory chunks.
+- MemoryOS uses `llm.invoke()` to break prompts into storable memory chunks during
+  `store()`, and to generate merged summaries during `consolidate()`.
 - MemoryOS uses an internal SentenceTransformer embedder for vector storage and retrieval.
 - MemoryOS consolidation uses `scikit-learn` for cosine AgglomerativeClustering.
 - Required init config is exactly `qdrant_url`, `qdrant_api_key`, and `llm`.
