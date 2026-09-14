@@ -47,3 +47,10 @@ target-version = ["py310"]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["memory_os*"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["memory_os*"]
+
+[tool.setuptools.package-data]
+memory_os = ["py.typed"]
