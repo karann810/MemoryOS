@@ -58,6 +58,7 @@ STABILITY_GROWTH = 0.75
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 CONSOLIDATION_DISTANCE_THRESHOLD = 0.15
+CONSOLIDATION_TRIGGER_COUNT = 20
 
 EMOTION_WEIGHTS = {
     "joy": 1.15,
@@ -112,7 +113,7 @@ Memory texts:
 class MemoryOS:
     """Small public API: store prompt memories, retrieve context."""
 
-    # _user_pairs: dict[str, list[dict[str, Any]]] = {}
+    _user_pairs: dict[str, list[dict[str, Any]]] = {}
 
     def __init__(
         self,
@@ -150,18 +151,15 @@ class MemoryOS:
         self._payload_indexes_ready = False
         self._embedder = SentenceTransformer(DEFAULT_EMBEDDING_MODEL)
 
-        self._user_pairs: dict[str, list[dict[str, Any]]] = {}
+        self._user_pairs: dict[str, list[dict[str, Any]]] = self._user_pairs
+        self._store_counts: dict[str, int] = {}
 
         # Eagerly create the collection + payload indexes now, instead of
         # waiting for the first successful .store() call. This guarantees
         # .retrieve() never hits a "missing index" 400 error, even if it's
         # called before any .store(), or in a fresh process/kernel.
 
-        embedding = self._embedder.encode("Hello world")
-
-# Check the shape of the vector
-        vector_size = embedding.shape[0]
-        # vector_size = self._embedder.get_sentence_embedding_dimension()
+        vector_size = self._embedder.get_sentence_embedding_dimension()
         self._ensure_collection(vector_size)
 
     def store(
@@ -169,10 +167,10 @@ class MemoryOS:
         prompt: str,
         response: str,
         user_id: str | None = None,
-    ) -> None:
-        """Extract prompt memories into Qdrant and keep the raw pair in user-scoped history."""
+    ) -> dict[str, bool]:
+        """Extract prompt memories into Qdrant and keep the raw pair in user-scoped history. Returns recommendation signal for consolidation."""
         if not prompt or not response:
-            return
+            return {"consolidation_recommended": False}
 
         effective_user_id = user_id or ""
 
@@ -220,6 +218,16 @@ class MemoryOS:
             user_id=effective_user_id,
         )
 
+        current_count = self._store_counts.get(effective_user_id, 0) + 1
+        if current_count >= CONSOLIDATION_TRIGGER_COUNT:
+            self._store_counts[effective_user_id] = 0
+            recommended = True
+        else:
+            self._store_counts[effective_user_id] = current_count
+            recommended = False
+
+        return {"consolidation_recommended": recommended}
+
     def retrieve(self, prompt: str, user_id: str | None = None) -> dict:
         """Return decay-ranked Qdrant memories plus recent prompt/response pairs.
         Optional `user_id` scopes the read to a distinct user memory namespace.
@@ -253,6 +261,7 @@ class MemoryOS:
 
     def consolidate(self, user_id: str) -> dict:
         """Cluster and merge semantically-similar user memories into one summary point."""
+        self._store_counts[user_id] = 0
         if not self._collection_exists():
             return {"clusters_merged": 0, "points_removed": 0}
 
@@ -284,8 +293,6 @@ class MemoryOS:
         points_removed = 0
         for cluster in groups.values():
             if len(cluster) == 1:
-                continue
-            if len(cluster) < 2:
                 continue
 
             texts = [self._point_text(point) for point in cluster]

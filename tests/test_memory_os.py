@@ -1,5 +1,4 @@
 import json
-import time
 from types import SimpleNamespace
 
 from memory_os.memory import MemoryOS, PointStruct
@@ -397,3 +396,22 @@ def test_consolidate_merged_points_do_not_get_deleted_by_pair_eviction(monkeypat
     merged_point = [point for point in client.points if point.payload.get("merged_from") == 2]
     assert len(merged_point) == 1
     assert merged_point[0].payload["pair_id"] is None
+
+
+def test_store_consolidation_recommended_flag_threshold_and_reset(monkeypatch):
+    memory, client, _ = make_memory(monkeypatch)
+
+    for index in range(1, 20):
+        result = memory.store(f"prompt {index}", f"response {index}", user_id="user_1")
+        assert result == {"consolidation_recommended": False}
+
+    result_20 = memory.store("prompt 20", "response 20", user_id="user_1")
+    assert result_20 == {"consolidation_recommended": True}
+
+    result_21 = memory.store("prompt 21", "response 21", user_id="user_1")
+    assert result_21 == {"consolidation_recommended": False}
+
+    result_user2 = memory.store("prompt user 2", "response user 2", user_id="user_2")
+    assert result_user2 == {"consolidation_recommended": False}
+    assert memory._store_counts.get("user_2") == 1
+

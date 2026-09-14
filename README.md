@@ -27,17 +27,15 @@ memory = MemoryOS(
     llm=configured_llm,                    # any object with .invoke()
 )
 
-memory.store(prompt: str, response: str, user_id: str | None = None) -> None
+memory.store(prompt: str, response: str, user_id: str | None = None) -> dict[str, bool]
 memory.retrieve(prompt: str, user_id: str | None = None) -> dict
 memory.consolidate(user_id: str) -> dict
 ```
 
 That is the intended public surface, with `consolidate()` intentionally
 called explicitly rather than automatically from the hot `store()` or
-`retrieve()` paths. The constructor does not carry any session or user
-identity field. The caller should provide the effective `user_id` on the
-per-call `store`, `retrieve`, and `consolidate` operations so the same code
-path can remain user-scoped without a constructor-level identity surface.
+`retrieve()` paths. The package signals when consolidation is recommended
+via `store()`, allowing the host app to trigger `consolidate(user_id)` asynchronously.
 
 ## Usage
 
@@ -48,14 +46,18 @@ final_response = host_llm.invoke(
     f"Relevant memory:\n{context}\n\nUser:\n{user_prompt}"
 )
 
-memory.store(user_prompt, final_response, user_id="user_123")
-summary = memory.consolidate("user_123")
+result = memory.store(user_prompt, final_response, user_id="user_123")
+if result.get("consolidation_recommended"):
+    # Host app schedules background worker for consolidation
+    background_worker.enqueue(memory.consolidate, "user_123")
 ```
 
 ## Behavior
 
 - `store(prompt, response, user_id=None)` calls `llm.invoke(...)` once to distill the completed
   prompt into multiple important memory chunks.
+- `store(prompt, response, user_id=None)` returns `{"consolidation_recommended": bool}`, which becomes
+  `True` every 20 stores for that specific user, signaling that consolidation should be run.
 - `store(prompt, response, user_id=None)` embeds each extracted memory chunk with an internal
   SentenceTransformer model, then upserts those chunks separately to Qdrant.
 - `store(prompt, response, user_id=None)` also stores the raw prompt/response pair in a simple

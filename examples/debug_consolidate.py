@@ -1,8 +1,7 @@
-import json
-from types import SimpleNamespace
 from pytest import MonkeyPatch
+
 from memory_os.memory import MemoryOS, PointStruct
-from tests.test_memory_os import FakeLLM, FakeSentenceTransformer, FakeQdrantClient
+from tests.test_memory_os import FakeLLM, FakeQdrantClient, FakeSentenceTransformer
 
 mp = MonkeyPatch()
 clients = []
